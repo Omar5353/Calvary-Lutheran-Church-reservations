@@ -22,7 +22,7 @@ A small Streamlit app for taking event space requests and tracking them on a cal
 | --- | --- |
 | Friday | 6:30-10:30 p.m. |
 | Saturday | 1:00-5:00 p.m. |
-| Sunday | 3:00-7:00 p.m. |
+| Sunday | 4:00-8:00 p.m. |
 
 One event per date. Mon-Thu are shown as not bookable.
 
@@ -84,7 +84,7 @@ Edit the `SLOTS` dictionary near the top of `app.py`. Keys are Python weekday nu
 SLOTS = {
     4: {"day": "Friday",   "label": "6:30-10:30 p.m.", "start": "18:30", "end": "22:30"},
     5: {"day": "Saturday", "label": "1:00-5:00 p.m.",  "start": "13:00", "end": "17:00"},
-    6: {"day": "Sunday",   "label": "3:00-7:00 p.m.",  "start": "15:00", "end": "19:00"},
+    6: {"day": "Sunday",   "label": "4:00-8:00 p.m.",  "start": "16:00", "end": "20:00"},
 }
 ```
 

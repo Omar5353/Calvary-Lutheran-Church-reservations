@@ -36,7 +36,7 @@ DB_PATH = os.environ.get("CALVARY_DB", os.path.join(os.path.dirname(os.path.absp
 SLOTS = {
     4: {"day": "Friday", "label": "6:30-10:30 p.m.", "start": "18:30", "end": "22:30"},
     5: {"day": "Saturday", "label": "1:00-5:00 p.m.", "start": "13:00", "end": "17:00"},
-    6: {"day": "Sunday", "label": "3:00-7:00 p.m.", "start": "15:00", "end": "19:00"},
+    6: {"day": "Sunday", "label": "4:00-8:00 p.m.", "start": "16:00", "end": "20:00"},
 }
 
 STATUS_PENDING = "Pending"
@@ -541,7 +541,7 @@ def availability_section() -> None:
     st.subheader("Availability calendar")
     st.write(
         "The building is available on **Friday 6:30-10:30 p.m.**, **Saturday 1:00-5:00 p.m.** "
-        "and **Sunday 3:00-7:00 p.m.** Names and event details are not shown publicly."
+        "and **Sunday 4:00-8:00 p.m.** Names and event details are not shown publicly."
     )
     render_calendar(show_details=False, key="public_month")
 
@@ -721,7 +721,7 @@ def main() -> None:
         "**Available times**  \n"
         "Friday, 6:30-10:30 p.m.  \n"
         "Saturday, 1:00-5:00 p.m.  \n"
-        "Sunday, 3:00-7:00 p.m."
+        "Sunday, 4:00-8:00 p.m."
     )
 
     if page == "Request a reservation":
