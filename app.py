@@ -502,6 +502,27 @@ def _secret(name: str) -> str | None:
     return os.environ.get(name.upper())
 
 
+def app_password() -> str | None:
+    """
+    The Gmail app password, with every space removed.
+
+    Google displays the 16-character code in four groups, and copying it
+    brings the separators along. Some of those are non-breaking spaces
+    (U+00A0), which smtplib cannot encode as ASCII, so a pasted-as-shown
+    code fails with a UnicodeEncodeError before it ever reaches Gmail.
+    str.split() treats U+00A0 as whitespace, so this handles both kinds.
+    """
+    raw = _secret("gmail_app_password")
+    if not raw:
+        return None
+    cleaned = "".join(raw.split())
+    try:
+        cleaned.encode("ascii")
+    except UnicodeEncodeError:
+        return None
+    return cleaned or None
+
+
 def notify_new_request(res_id: int) -> tuple[bool, str]:
     """
     Email the request details the moment it is submitted.
@@ -519,7 +540,7 @@ def notify_new_request(res_id: int) -> tuple[bool, str]:
         except Exception:
             pass
 
-    password = _secret("gmail_app_password")
+    password = app_password()
     if not password:
         record("not configured")
         return False, "No app password configured, notification skipped."
@@ -572,7 +593,7 @@ def notify_new_request(res_id: int) -> tuple[bool, str]:
 
 def send_test_email() -> tuple[bool, str]:
     """Prove the SMTP settings work without needing a real request."""
-    password = _secret("gmail_app_password")
+    password = app_password()
     if not password:
         return False, "No app password configured."
 
@@ -845,7 +866,7 @@ def page_admin() -> None:
         st.session_state["admin_ok"] = False
         st.rerun()
 
-    if not _secret("gmail_app_password"):
+    if not app_password():
         st.warning(
             "Automatic email notifications are off. Add `gmail_app_password` to your secrets "
             "to have new requests emailed to " + NOTIFY_EMAIL + " as they arrive."
@@ -854,7 +875,10 @@ def page_admin() -> None:
         c_test, c_msg = st.columns([1, 3])
         if c_test.button("Send a test email"):
             ok, msg = send_test_email()
-            c_msg.success(f"Test email sent to {NOTIFY_EMAIL}.") if ok else c_msg.error(msg)
+            if ok:
+                c_msg.success(f"Test email sent to {NOTIFY_EMAIL}.")
+            else:
+                c_msg.error(f"Could not send: {msg}")
 
     tab_cal, tab_review, tab_table = st.tabs(["Calendar", "Review requests", "All reservations"])
 
