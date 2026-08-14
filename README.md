@@ -13,6 +13,7 @@ A small Streamlit app for taking event space requests and tracking them on a cal
 
 - Calendar with the requester's name, purpose, and headcount written into each booked day.
 - *Review requests*: approve or decline each pending request, with an optional internal note. Approving flips it to **Reserved**; declining frees the date up again.
+- *Email the office*: every request carries a **Draft email to the office** button. It opens a Gmail compose window already addressed and filled in with the date, time, name, purpose, headcount, contact info and comments, so you skim it and hit Send. Nothing is sent automatically. A **Preview the email** expander shows exactly what will be in it, and a second button hands the same draft to whatever mail app the computer uses by default.
 - *All reservations*: filterable, searchable table with every field, plus a CSV download and controls to change a status or delete an entry.
 
 ## Bookable slots
@@ -61,6 +62,19 @@ Everything lives in `reservations.db`, a SQLite file created next to `app.py` on
 4. Share the public URL with the congregation. You reach the admin view through the same URL, under *Admin* in the sidebar.
 
 Note on Streamlit Community Cloud: its disk is not permanent, so the database can be wiped when the app restarts or redeploys. Download the CSV from the admin tab regularly, or move the storage to Google Sheets or Postgres if the app will be in heavy use. Running it on a church computer or a small VPS keeps the SQLite file intact.
+
+## Changing the email addresses
+
+Near the top of `app.py`:
+
+```python
+EMAIL_FROM = "5353murad@gmail.com"      # the Gmail account the draft opens in
+EMAIL_TO = "office@calvarylincoln.org"  # who the draft is addressed to
+EMAIL_CC = ""                           # optional, comma separated
+EMAIL_SIGNOFF = "Omar"
+```
+
+`EMAIL_FROM` is passed to Gmail as the `authuser` hint. If you are signed into several Google accounts in the same browser, Gmail opens the compose window in that one. If you are signed into only one account, it opens there regardless. The wording of the message itself is in `_email_parts()` a little further down.
 
 ## Changing the time slots
 

@@ -72,4 +72,38 @@ check("filter by status works", set(app.all_reservations((app.STATUS_RESERVED,))
 app.delete_reservation(rid)
 check("delete works", rid not in app.all_reservations()["id"].tolist())
 
+# ---- email drafting ----
+print()
+row = app.all_reservations().iloc[0]
+subj, body = app._email_parts(row)
+check("subject has the name", row["name"] in subj)
+check("body has purpose", row["purpose"] in body)
+check("formal greeting", body.startswith("Dear Leanna,"))
+check("formal signoff", body.rstrip().endswith("Omar Murad"))
+check("body has headcount", str(row["num_people"]) in body)
+url = app.gmail_compose_url(row)
+check("gmail url host", url.startswith("https://mail.google.com/mail/?"))
+check("to address encoded", "office%40calvarylincoln.org" in url)
+check("from account pinned", "authuser=5353murad%40gmail.com" in url)
+check("newlines encoded", "%0A" in url)
+check("no raw spaces in url", " " not in url)
+mt = app.mailto_url(row)
+check("mailto target", mt.startswith("mailto:office@calvarylincoln.org?"))
+
+from urllib.parse import urlparse, parse_qs
+q = parse_qs(urlparse(url).query)
+check("subject round trips", q["su"][0] == subj)
+check("body round trips", q["body"][0] == body)
+
+# a request with an apostrophe and an ampersand should survive encoding
+import datetime as _dt
+d2 = next_weekday(6, 3)
+app.create_request(d2, "O'Brien & Sons", "x@y.org", "", "Kid's party & potluck", 30, "Tables: 5 & chairs")
+r2 = app.all_reservations()[app.all_reservations()["event_date"] == d2.isoformat()].iloc[0]
+u2 = app.gmail_compose_url(r2)
+q2 = parse_qs(urlparse(u2).query)
+check("apostrophe survives", "O'Brien & Sons" in q2["su"][0])
+check("ampersand does not split params", "Kid's party & potluck" in q2["body"][0])
+check("to field not corrupted", q2["to"][0] == "office@calvarylincoln.org")
+
 print("\nAll checks passed.")

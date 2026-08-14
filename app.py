@@ -20,6 +20,7 @@ import os
 import sqlite3
 from contextlib import closing
 from datetime import date, datetime, timedelta
+from urllib.parse import quote, urlencode
 
 import pandas as pd
 import streamlit as st
@@ -42,6 +43,14 @@ STATUS_PENDING = "Pending"
 STATUS_RESERVED = "Reserved"
 STATUS_DECLINED = "Declined"
 ACTIVE_STATUSES = (STATUS_PENDING, STATUS_RESERVED)
+
+# Email notification. The admin view builds a pre-filled Gmail compose link
+# so a request can be forwarded to the church office in one click.
+EMAIL_FROM = "5353murad@gmail.com"     # the Gmail account the draft opens in
+EMAIL_TO = "office@calvarylincoln.org"  # who the draft is addressed to
+EMAIL_CC = ""                           # optional, comma separated
+EMAIL_GREETING_NAME = "Leanna"          # who the message is addressed to by name
+EMAIL_SIGNOFF = "Omar Murad"
 
 # How far ahead the public may request / browse.
 MONTHS_AHEAD = 6
@@ -312,6 +321,87 @@ def render_calendar(show_details: bool, key: str) -> None:
 
 
 # --------------------------------------------------------------------------
+# Email drafting
+# --------------------------------------------------------------------------
+
+
+def _email_parts(row) -> tuple[str, str]:
+    """Build the subject and body for one reservation."""
+    d = datetime.fromisoformat(row["event_date"]).date()
+    pretty = d.strftime("%A, %B %d, %Y")
+
+    subject = f"Building reservation request, {row['name']}, {pretty}"
+
+    greeting = f"Dear {EMAIL_GREETING_NAME}," if EMAIL_GREETING_NAME else "Good morning,"
+
+    lines = [
+        greeting,
+        "",
+        "I hope this message finds you well. A request to reserve the church building "
+        "came in through the online reservation form, and I am passing along the details "
+        "for the office calendar.",
+        "",
+        f"Date:              {pretty}",
+        f"Time:              {row['slot_label']}",
+        f"Requested by:      {row['name']}",
+        f"Purpose:           {row['purpose']}",
+        f"Number attending:  {row['num_people']}",
+        f"Email:             {row['email'] or 'not provided'}",
+        f"Phone:             {row['phone'] or 'not provided'}",
+    ]
+    if row["comments"]:
+        lines.append(f"Additional notes:  {row['comments']}")
+    lines += [
+        f"Submitted:         {str(row['submitted_at']).replace('T', ' ')}",
+        "",
+        f"The request is currently marked as {row['status'].lower()}, and the requester has "
+        "been told that it is not confirmed until the church approves it.",
+        "",
+        "Could you let me know whether the building is available at that time, and whether "
+        "anything needs to be arranged on your end before I confirm with them? I am glad to "
+        "follow up with the requester directly once I hear back from you.",
+        "",
+        "Thank you for your help.",
+        "",
+        "Kind regards,",
+        EMAIL_SIGNOFF,
+    ]
+    return subject, "\n".join(lines)
+
+
+def gmail_compose_url(row) -> str:
+    """A Gmail compose window, pre-filled and ready to review and send."""
+    subject, body = _email_parts(row)
+    params = {"view": "cm", "fs": "1", "to": EMAIL_TO, "su": subject, "body": body}
+    if EMAIL_CC:
+        params["cc"] = EMAIL_CC
+    if EMAIL_FROM:
+        params["authuser"] = EMAIL_FROM
+    return "https://mail.google.com/mail/?" + urlencode(params, quote_via=quote)
+
+
+def mailto_url(row) -> str:
+    """Fallback for whatever mail app the computer uses by default."""
+    subject, body = _email_parts(row)
+    params = {"subject": subject, "body": body}
+    if EMAIL_CC:
+        params["cc"] = EMAIL_CC
+    return f"mailto:{EMAIL_TO}?" + urlencode(params, quote_via=quote)
+
+
+def draft_email_controls(row, key: str) -> None:
+    """Draft button plus a preview expander for one reservation."""
+    subject, body = _email_parts(row)
+    a, b = st.columns([1, 1])
+    a.link_button("Draft email to the office", gmail_compose_url(row), type="secondary")
+    b.link_button("Use my default mail app", mailto_url(row))
+    with st.expander("Preview the email"):
+        st.caption(f"From {EMAIL_FROM} to {EMAIL_TO}")
+        st.text_input("Subject", subject, disabled=True, key=f"subj_{key}")
+        st.code(body, language=None)
+
+
+# --------------------------------------------------------------------------
 # Pages
 # --------------------------------------------------------------------------
 
@@ -528,6 +618,9 @@ def page_admin() -> None:
                 if r["comments"]:
                     st.caption(f"Comments: {r['comments']}")
                 st.caption(f"Submitted {r['submitted_at'].replace('T', ' ')}")
+
+                draft_email_controls(r, key=f"pending_{r['id']}")
+
                 note = st.text_input("Internal note (optional)", key=f"note_{r['id']}")
                 b1, b2, _ = st.columns([1, 1, 4])
                 if b1.button("Approve", key=f"ok_{r['id']}", type="primary"):
@@ -583,8 +676,18 @@ def page_admin() -> None:
         )
 
         st.divider()
-        st.markdown("**Change a reservation**")
+        st.markdown("**Email the office about one of these**")
         ids = view["id"].tolist()
+        if ids:
+            def label_for(i: int) -> str:
+                r = view[view["id"] == i].iloc[0]
+                return f"#{i}, {r['event_date']}, {r['name']}"
+
+            mail_id = st.selectbox("Reservation", ids, format_func=label_for, key="mail_pick")
+            draft_email_controls(view[view["id"] == mail_id].iloc[0], key=f"table_{mail_id}")
+
+        st.divider()
+        st.markdown("**Change a reservation**")
         if ids:
             c1, c2, c3 = st.columns([1, 2, 1])
             pick = c1.selectbox("ID", ids)
