@@ -17,8 +17,10 @@ from __future__ import annotations
 import calendar as pycalendar
 import io
 import os
+import smtplib
 import sqlite3
 from contextlib import closing
+from email.message import EmailMessage
 from datetime import date, datetime, timedelta
 from urllib.parse import quote, urlencode
 
@@ -52,6 +54,19 @@ EMAIL_CC = ""                           # optional, comma separated
 EMAIL_GREETING_NAME = "Leanna"          # who the message is addressed to by name
 EMAIL_SIGNOFF = "Omar Murad"
 
+# Automatic notification sent the moment a request is submitted.
+NOTIFY_EMAIL = "5353murad@gmail.com"
+SMTP_HOST = "smtp.gmail.com"
+SMTP_PORT = 465
+SMTP_USER = "5353murad@gmail.com"
+# The app password comes from st.secrets["gmail_app_password"] or the
+# GMAIL_APP_PASSWORD environment variable. Without it, notifications are
+# skipped and reservations still work normally.
+
+# At most this many active (pending or reserved) reservations per calendar
+# month. Declined requests do not count, so declining frees a slot back up.
+MAX_PER_MONTH = 2
+
 # How far ahead the public may request / browse.
 MONTHS_AHEAD = 6
 
@@ -59,6 +74,7 @@ COLORS = {
     "available": ("#e8f5e9", "#2e7d32", "Available"),
     "pending": ("#fff4e0", "#b26a00", "Pending"),
     "reserved": ("#fdecec", "#c62828", "Reserved"),
+    "full": ("#f2f2f7", "#6b6b8a", "Month full"),
     "closed": ("#f5f5f5", "#9e9e9e", ""),
     "past": ("#fafafa", "#c4c4c4", ""),
 }
@@ -106,6 +122,10 @@ def init_db() -> None:
             WHERE status IN ('Pending', 'Reserved')
             """
         )
+        # Added later: records whether the automatic notification went out.
+        cols = {r[1] for r in conn.execute("PRAGMA table_info(reservations)")}
+        if "notify_status" not in cols:
+            conn.execute("ALTER TABLE reservations ADD COLUMN notify_status TEXT")
 
 
 def slot_for(d: date) -> dict | None:
@@ -135,6 +155,30 @@ def status_map(start: date, end: date) -> dict[str, sqlite3.Row]:
     return {r["event_date"]: r for r in rows}
 
 
+def month_bounds(d: date) -> tuple[str, str]:
+    """First and last day of d's calendar month, as ISO strings."""
+    first = d.replace(day=1)
+    last = d.replace(day=pycalendar.monthrange(d.year, d.month)[1])
+    return first.isoformat(), last.isoformat()
+
+
+def active_count_in_month(d: date, conn: sqlite3.Connection | None = None) -> int:
+    """How many pending or reserved bookings already sit in d's month."""
+    first, last = month_bounds(d)
+    sql = (
+        "SELECT COUNT(*) FROM reservations "
+        "WHERE status IN ('Pending', 'Reserved') AND event_date BETWEEN ? AND ?"
+    )
+    if conn is not None:
+        return conn.execute(sql, (first, last)).fetchone()[0]
+    with closing(get_conn()) as c:
+        return c.execute(sql, (first, last)).fetchone()[0]
+
+
+def month_is_full(d: date) -> bool:
+    return active_count_in_month(d) >= MAX_PER_MONTH
+
+
 def create_request(
     event_date: date,
     name: str,
@@ -150,9 +194,22 @@ def create_request(
     if event_date < date.today():
         return False, "That date has already passed."
 
-    try:
-        with closing(get_conn()) as conn, conn:
-            conn.execute(
+    row_id = None
+    with closing(get_conn()) as conn:
+        # BEGIN IMMEDIATE takes the write lock up front, so the count and the
+        # insert cannot be interleaved with another submission sneaking past
+        # the monthly cap.
+        conn.isolation_level = None
+        conn.execute("BEGIN IMMEDIATE")
+        try:
+            if active_count_in_month(event_date, conn) >= MAX_PER_MONTH:
+                conn.execute("ROLLBACK")
+                return False, (
+                    f"{event_date.strftime('%B %Y')} already has {MAX_PER_MONTH} reservations, "
+                    "which is the limit for one month. Please choose a date in another month."
+                )
+
+            cur = conn.execute(
                 """
                 INSERT INTO reservations
                     (event_date, day_name, slot_label, name, email, phone,
@@ -173,8 +230,16 @@ def create_request(
                     datetime.now().isoformat(timespec="seconds"),
                 ),
             )
-    except sqlite3.IntegrityError:
-        return False, "Sorry, that date was just taken. Please pick another one."
+            row_id = cur.lastrowid
+            conn.execute("COMMIT")
+        except sqlite3.IntegrityError:
+            conn.execute("ROLLBACK")
+            return False, "Sorry, that date was just taken. Please pick another one."
+
+    # The reservation is safely stored. Notifying is best effort from here on,
+    # so a mail problem can never cost someone their booking.
+    if row_id is not None:
+        notify_new_request(row_id)
     return True, "Request submitted."
 
 
@@ -189,7 +254,26 @@ def all_reservations(statuses: tuple[str, ...] | None = None) -> pd.DataFrame:
         return pd.read_sql_query(query, conn, params=params)
 
 
+def get_reservation(res_id: int) -> sqlite3.Row | None:
+    with closing(get_conn()) as conn:
+        return conn.execute("SELECT * FROM reservations WHERE id = ?", (res_id,)).fetchone()
+
+
 def set_status(res_id: int, status: str, note: str = "") -> tuple[bool, str]:
+    row = get_reservation(res_id)
+    if row is None:
+        return False, "That reservation no longer exists."
+
+    d = datetime.fromisoformat(row["event_date"]).date()
+
+    # Bringing a declined request back to life must respect the monthly cap.
+    if status in ACTIVE_STATUSES and row["status"] not in ACTIVE_STATUSES:
+        if active_count_in_month(d) >= MAX_PER_MONTH:
+            return False, (
+                f"{d.strftime('%B %Y')} already has {MAX_PER_MONTH} active reservations. "
+                "Decline one of those first."
+            )
+
     try:
         with closing(get_conn()) as conn, conn:
             conn.execute(
@@ -211,7 +295,13 @@ def delete_reservation(res_id: int) -> None:
 # --------------------------------------------------------------------------
 
 
-def month_html(year: int, month: int, taken: dict[str, sqlite3.Row], show_details: bool) -> str:
+def month_html(
+    year: int,
+    month: int,
+    taken: dict[str, sqlite3.Row],
+    show_details: bool,
+    month_full: bool = False,
+) -> str:
     today = date.today()
     cal = pycalendar.Calendar(firstweekday=6)  # weeks start on Sunday
 
@@ -254,7 +344,7 @@ def month_html(year: int, month: int, taken: dict[str, sqlite3.Row], show_detail
             elif d < today:
                 key = "past"
             elif row is None:
-                key = "available"
+                key = "full" if month_full else "available"
             elif row["status"] == STATUS_RESERVED:
                 key = "reserved"
             else:
@@ -264,7 +354,7 @@ def month_html(year: int, month: int, taken: dict[str, sqlite3.Row], show_detail
             cell = f'<div class="daynum" style="color:{fg}">{d.day}</div>'
 
             if slot is not None:
-                if key in ("available", "pending", "reserved"):
+                if key in ("available", "pending", "reserved", "full"):
                     cell += f'<div class="badge" style="color:{fg}">{text}</div>'
                     cell += f'<div class="slot">{slot["label"]}</div>'
                 else:  # past
@@ -284,7 +374,7 @@ def month_html(year: int, month: int, taken: dict[str, sqlite3.Row], show_detail
         + "".join(
             f'<span><i class="dot" style="background:{COLORS[k][0]};'
             f'border-color:{COLORS[k][1]}"></i>{COLORS[k][2]}</span>'
-            for k in ("available", "pending", "reserved")
+            for k in ("available", "pending", "reserved", "full")
         )
         + '<span><i class="dot" style="background:#f5f5f5"></i>Not a bookable day</span>'
         + "</div>"
@@ -317,7 +407,12 @@ def render_calendar(show_details: bool, key: str) -> None:
     year, month = month_picker(key)
     first = date(year, month, 1)
     last = date(year, month, pycalendar.monthrange(year, month)[1])
-    st.markdown(month_html(year, month, status_map(first, last), show_details), unsafe_allow_html=True)
+    used = active_count_in_month(first)
+    st.caption(f"{used} of {MAX_PER_MONTH} reservations used in {pycalendar.month_name[month]} {year}")
+    st.markdown(
+        month_html(year, month, status_map(first, last), show_details, month_full=used >= MAX_PER_MONTH),
+        unsafe_allow_html=True,
+    )
 
 
 # --------------------------------------------------------------------------
@@ -369,6 +464,109 @@ def _email_parts(row) -> tuple[str, str]:
     return subject, "\n".join(lines)
 
 
+def _secret(name: str) -> str | None:
+    """Read a value from st.secrets, falling back to the environment."""
+    try:
+        val = st.secrets.get(name)
+        if val:
+            return str(val)
+    except Exception:
+        pass
+    return os.environ.get(name.upper())
+
+
+def notify_new_request(res_id: int) -> tuple[bool, str]:
+    """
+    Email the request details the moment it is submitted.
+
+    Never raises. If no app password is configured, or the mail server is
+    unreachable, the reservation still stands and the failure is recorded in
+    the session so the admin page can show it.
+    """
+    def record(state: str) -> None:
+        try:
+            with closing(get_conn()) as conn, conn:
+                conn.execute(
+                    "UPDATE reservations SET notify_status = ? WHERE id = ?", (state, res_id)
+                )
+        except Exception:
+            pass
+
+    password = _secret("gmail_app_password")
+    if not password:
+        record("not configured")
+        return False, "No app password configured, notification skipped."
+
+    row = get_reservation(res_id)
+    if row is None:
+        return False, "Reservation not found."
+
+    d = datetime.fromisoformat(row["event_date"]).date()
+    lines = [
+        "A new reservation request was submitted through the scheduler.",
+        "",
+        f"Date:              {d.strftime('%A, %B %d, %Y')}",
+        f"Time:              {row['slot_label']}",
+        f"Requested by:      {row['name']}",
+        f"Purpose:           {row['purpose']}",
+        f"Number attending:  {row['num_people']}",
+        f"Email:             {row['email'] or 'not provided'}",
+        f"Phone:             {row['phone'] or 'not provided'}",
+    ]
+    if row["comments"]:
+        lines.append(f"Comments:          {row['comments']}")
+    lines += [
+        f"Submitted:         {str(row['submitted_at']).replace('T', ' ')}",
+        "",
+        f"This month now holds {active_count_in_month(d)} of {MAX_PER_MONTH} allowed reservations.",
+        "",
+        "Open the Admin page to approve or decline it.",
+    ]
+
+    msg = EmailMessage()
+    msg["Subject"] = f"New request: {row['name']}, {d.strftime('%a %b %d, %Y')}, {row['slot_label']}"
+    msg["From"] = SMTP_USER
+    msg["To"] = NOTIFY_EMAIL
+    if row["email"]:
+        msg["Reply-To"] = row["email"]
+    msg.set_content("\n".join(lines))
+
+    try:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+            s.login(SMTP_USER, password)
+            s.send_message(msg)
+    except Exception as exc:  # noqa: BLE001 - never block a booking on mail
+        record(f"failed: {type(exc).__name__}")
+        return False, str(exc)
+
+    record(f"sent {datetime.now().strftime('%Y-%m-%d %H:%M')}")
+    return True, "Notification sent."
+
+
+def send_test_email() -> tuple[bool, str]:
+    """Prove the SMTP settings work without needing a real request."""
+    password = _secret("gmail_app_password")
+    if not password:
+        return False, "No app password configured."
+
+    msg = EmailMessage()
+    msg["Subject"] = "Test from the Calvary Lutheran Church scheduler"
+    msg["From"] = SMTP_USER
+    msg["To"] = NOTIFY_EMAIL
+    msg.set_content(
+        "This is a test message from the reservation scheduler.\n\n"
+        "If you are reading it, automatic notifications are working and you will "
+        "get one of these each time somebody submits a request."
+    )
+    try:
+        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as s:
+            s.login(SMTP_USER, password)
+            s.send_message(msg)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+    return True, "Sent."
+
+
 def gmail_compose_url(row) -> str:
     """A Gmail compose window, pre-filled and ready to review and send."""
     subject, body = _email_parts(row)
@@ -417,10 +615,24 @@ def page_request() -> None:
     today = date.today()
     horizon = today + timedelta(days=31 * MONTHS_AHEAD)
     taken = status_map(today, horizon)
-    open_dates = [d for d in bookable_dates(today, horizon) if d.isoformat() not in taken]
+
+    full_months = set()
+    for d in bookable_dates(today, horizon):
+        ym = (d.year, d.month)
+        if ym not in full_months and month_is_full(d):
+            full_months.add(ym)
+
+    open_dates = [
+        d
+        for d in bookable_dates(today, horizon)
+        if d.isoformat() not in taken and (d.year, d.month) not in full_months
+    ]
 
     if not open_dates:
-        st.warning("There are no open dates in the next few months. Please check back later.")
+        st.warning(
+            "There are no open dates in the next few months. Every month is either fully "
+            f"booked or already at the limit of {MAX_PER_MONTH} reservations. Please check back later."
+        )
         availability_section()
         return
 
@@ -481,10 +693,18 @@ def page_request() -> None:
             f"{taken[chosen.isoformat()]['status'].lower()}. Please choose another date."
         )
         st.error(blocker)
+    elif (chosen.year, chosen.month) in full_months:
+        blocker = (
+            f"**{chosen.strftime('%B %Y')}** already has {MAX_PER_MONTH} reservations, which is "
+            "the limit for one month. Please pick a date in a different month."
+        )
+        st.error(blocker)
     else:
         blocker = None
+        left = MAX_PER_MONTH - active_count_in_month(chosen)
         st.success(
             f"**{chosen.strftime('%A, %B %d, %Y')}**, {picked_slot['label']} is open. "
+            f"{left} of {MAX_PER_MONTH} reservations remaining in {chosen.strftime('%B')}. "
             "Fill out the details below."
         )
 
@@ -598,6 +818,17 @@ def page_admin() -> None:
         st.session_state["admin_ok"] = False
         st.rerun()
 
+    if not _secret("gmail_app_password"):
+        st.warning(
+            "Automatic email notifications are off. Add `gmail_app_password` to your secrets "
+            "to have new requests emailed to " + NOTIFY_EMAIL + " as they arrive."
+        )
+    else:
+        c_test, c_msg = st.columns([1, 3])
+        if c_test.button("Send a test email"):
+            ok, msg = send_test_email()
+            c_msg.success(f"Test email sent to {NOTIFY_EMAIL}.") if ok else c_msg.error(msg)
+
     tab_cal, tab_review, tab_table = st.tabs(["Calendar", "Review requests", "All reservations"])
 
     with tab_cal:
@@ -656,13 +887,15 @@ def page_admin() -> None:
 
         show = view[
             ["id", "event_date", "day_name", "slot_label", "name", "purpose",
-             "num_people", "email", "phone", "comments", "status", "submitted_at", "admin_note"]
+             "num_people", "email", "phone", "comments", "status", "submitted_at",
+             "notify_status", "admin_note"]
         ].rename(
             columns={
                 "id": "ID", "event_date": "Date", "day_name": "Day", "slot_label": "Time",
                 "name": "Name", "purpose": "Purpose", "num_people": "People",
                 "email": "Email", "phone": "Phone", "comments": "Comments",
-                "status": "Status", "submitted_at": "Submitted", "admin_note": "Note",
+                "status": "Status", "submitted_at": "Submitted",
+                "notify_status": "Emailed", "admin_note": "Note",
             }
         )
         st.dataframe(show, hide_index=True, use_container_width=True)

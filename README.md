@@ -26,6 +26,33 @@ A small Streamlit app for taking event space requests and tracking them on a cal
 
 One event per date. Mon-Thu are shown as not bookable.
 
+## Monthly limit
+
+At most **2 active reservations per calendar month**, set by `MAX_PER_MONTH` in `app.py`. Pending counts toward the limit, the same as Reserved, so two unreviewed requests close the month until you act on one. Declining frees the slot immediately and the month reopens.
+
+When a month is full, its remaining dates are dropped from the date picker, the calendar greys them out and labels them "Month full", and the request form refuses to submit if someone types the date in by hand. The check also runs inside the database transaction, so two people submitting at the same instant cannot both slip through. Re-approving a previously declined request is blocked too if the month has since filled up.
+
+## Automatic email notification
+
+Every submitted request is emailed to the address in `NOTIFY_EMAIL` right away, with the requester's email set as Reply-To so you can answer them directly. This is separate from the **Draft email to the office** button, which stays manual.
+
+It needs a Gmail app password, which is not your normal Google password:
+
+1. Turn on 2-Step Verification for the sending account at https://myaccount.google.com/security
+2. Go to https://myaccount.google.com/apppasswords and create one named e.g. "Calvary scheduler"
+3. Google shows a 16-character code. Put it in `.streamlit/secrets.toml` alongside the admin password:
+
+   ```toml
+   admin_password = "your-admin-password"
+   gmail_app_password = "abcdefghijklmnop"
+   ```
+
+   On Streamlit Community Cloud, put both lines in the app's *Settings, Secrets* panel instead.
+
+4. Open the Admin page and click **Send a test email** to confirm it works.
+
+Without the app password the app runs normally and just skips notifications, and the admin page shows a banner saying so. If a send fails, the reservation is still saved and the *Emailed* column in the All reservations table records what happened.
+
 ## Setup
 
 ```bash
