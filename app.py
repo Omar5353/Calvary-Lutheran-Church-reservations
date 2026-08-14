@@ -389,7 +389,11 @@ def month_html(
 
 
 def month_picker(key: str) -> tuple[int, int]:
-    """Sidebar-free month selector, returns (year, month)."""
+    """
+    Month selector with Previous and Next buttons either side of a dropdown.
+    Returns (year, month). The buttons stop at the ends of the browsable range
+    rather than wrapping around.
+    """
     today = date.today()
     options = []
     y, m = today.year, today.month
@@ -399,7 +403,30 @@ def month_picker(key: str) -> tuple[int, int]:
         if m == 13:
             m, y = 1, y + 1
     labels = [f"{pycalendar.month_name[m]} {y}" for y, m in options]
-    choice = st.selectbox("Month", labels, key=key)
+
+    sel_key = f"{key}_sel"
+    if sel_key not in st.session_state:
+        st.session_state[sel_key] = labels[0]
+    idx = labels.index(st.session_state[sel_key])
+
+    st.markdown("**Month**")
+    c_prev, c_sel, c_next = st.columns([1.2, 4, 1.2], vertical_alignment="center")
+
+    if c_prev.button(
+        "◀ Previous", key=f"{key}_prev", disabled=idx == 0, use_container_width=True
+    ):
+        st.session_state[sel_key] = labels[idx - 1]
+        st.rerun()
+
+    if c_next.button(
+        "Next ▶", key=f"{key}_next", disabled=idx >= len(labels) - 1, use_container_width=True
+    ):
+        st.session_state[sel_key] = labels[idx + 1]
+        st.rerun()
+
+    choice = c_sel.selectbox(
+        "Month", labels, key=sel_key, label_visibility="collapsed"
+    )
     return options[labels.index(choice)]
 
 
