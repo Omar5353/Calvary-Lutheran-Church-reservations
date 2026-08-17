@@ -83,49 +83,207 @@ COLORS = {
 # --------------------------------------------------------------------------
 # Database layer
 # --------------------------------------------------------------------------
+def _raw_secret(name: str) -> str | None:
+    """
+    Read a config value from st.secrets, falling back to the environment.
+
+    Defined early because the storage layer needs the connection string
+    before anything else runs.
+    """
+    try:
+        val = st.secrets.get(name)
+        if val:
+            return str(val).strip()
+    except Exception:
+        pass
+    val = os.environ.get(name.upper())
+    return val.strip() if val else None
 
 
-def get_conn() -> sqlite3.Connection:
-    conn = sqlite3.connect(DB_PATH, timeout=15)
-    conn.row_factory = sqlite3.Row
-    conn.execute("PRAGMA journal_mode=WAL")
-    return conn
+def postgres_url() -> str | None:
+    """
+    Supabase (or any Postgres) connection string, if one is configured.
+
+    When absent the app falls back to a local SQLite file, which keeps
+    development and offline use working with no setup at all.
+    """
+    url = _raw_secret("postgres_url")
+    if not url:
+        return None
+    # Supabase shows the URI with a placeholder for the password. Refuse it
+    # rather than failing later with a confusing authentication error.
+    if "[YOUR-PASSWORD]" in url or "[PASSWORD]" in url:
+        return None
+    return url
+
+
+def using_postgres() -> bool:
+    return postgres_url() is not None
+
+
+class Db:
+    """
+    A small connection wrapper so the rest of the app does not care which
+    database is behind it.
+
+    SQL is written with `?` placeholders throughout and translated to `%s`
+    for Postgres. Rows come back as mappings either way, so `row["name"]`
+    works regardless of backend.
+    """
+
+    def __init__(self):
+        self.pg = using_postgres()
+        if self.pg:
+            import psycopg2
+            import psycopg2.extras
+
+            self._err = psycopg2.IntegrityError
+            self.conn = psycopg2.connect(
+                postgres_url(),
+                connect_timeout=10,
+                cursor_factory=psycopg2.extras.RealDictCursor,
+            )
+        else:
+            self._err = sqlite3.IntegrityError
+            self.conn = sqlite3.connect(DB_PATH, timeout=15)
+            self.conn.row_factory = sqlite3.Row
+            # Autocommit, so an explicit BEGIN IMMEDIATE in lock_month() is
+            # not rejected as a transaction inside a transaction.
+            self.conn.isolation_level = None
+            self.conn.execute("PRAGMA journal_mode=WAL")
+
+    # -- context manager -------------------------------------------------
+    def __enter__(self) -> "Db":
+        return self
+
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        try:
+            if exc_type is None:
+                self.conn.commit()
+            else:
+                self.conn.rollback()
+        finally:
+            self.conn.close()
+        return False
+
+    @property
+    def integrity_error(self):
+        return self._err
+
+    def _sql(self, sql: str) -> str:
+        return sql.replace("?", "%s") if self.pg else sql
+
+    # -- queries ---------------------------------------------------------
+    def execute(self, sql: str, params: tuple = ()):
+        cur = self.conn.cursor()
+        cur.execute(self._sql(sql), params)
+        return cur
+
+    def fetchall(self, sql: str, params: tuple = ()) -> list:
+        cur = self.execute(sql, params)
+        rows = cur.fetchall()
+        cur.close()
+        return rows
+
+    def fetchone(self, sql: str, params: tuple = ()):
+        cur = self.execute(sql, params)
+        row = cur.fetchone()
+        cur.close()
+        return row
+
+    def scalar(self, sql: str, params: tuple = ()):
+        row = self.fetchone(sql, params)
+        if row is None:
+            return None
+        return list(row.values())[0] if isinstance(row, dict) else row[0]
+
+    def insert_returning_id(self, sql: str, params: tuple) -> int:
+        """INSERT that yields the new row's id on either backend."""
+        if self.pg:
+            cur = self.execute(sql + " RETURNING id", params)
+            new_id = list(cur.fetchone().values())[0]
+            cur.close()
+            return int(new_id)
+        cur = self.execute(sql, params)
+        new_id = cur.lastrowid
+        cur.close()
+        return int(new_id)
+
+    def lock_month(self, d: date) -> None:
+        """
+        Serialise submissions that land in the same calendar month, so the
+        monthly cap cannot be beaten by two people clicking at once.
+
+        SQLite takes the whole write lock; Postgres takes a per-month
+        advisory lock that is released when the transaction ends.
+        """
+        if self.pg:
+            self.execute("SELECT pg_advisory_xact_lock(?)", (d.year * 100 + d.month,))
+        else:
+            self.execute("BEGIN IMMEDIATE")
+
+
+def get_conn() -> Db:
+    return Db()
 
 
 def init_db() -> None:
-    with closing(get_conn()) as conn, conn:
-        conn.execute(
-            """
-            CREATE TABLE IF NOT EXISTS reservations (
-                id            INTEGER PRIMARY KEY AUTOINCREMENT,
-                event_date    TEXT    NOT NULL,
-                day_name      TEXT    NOT NULL,
-                slot_label    TEXT    NOT NULL,
-                name          TEXT    NOT NULL,
-                email         TEXT,
-                phone         TEXT,
-                purpose       TEXT    NOT NULL,
-                num_people    INTEGER,
-                comments      TEXT,
-                status        TEXT    NOT NULL DEFAULT 'Pending',
-                submitted_at  TEXT    NOT NULL,
-                admin_note    TEXT
+    with Db() as db:
+        if db.pg:
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reservations (
+                    id            SERIAL PRIMARY KEY,
+                    event_date    TEXT    NOT NULL,
+                    day_name      TEXT    NOT NULL,
+                    slot_label    TEXT    NOT NULL,
+                    name          TEXT    NOT NULL,
+                    email         TEXT,
+                    phone         TEXT,
+                    purpose       TEXT    NOT NULL,
+                    num_people    INTEGER,
+                    comments      TEXT,
+                    status        TEXT    NOT NULL DEFAULT 'Pending',
+                    submitted_at  TEXT    NOT NULL,
+                    admin_note    TEXT,
+                    notify_status TEXT
+                )
+                """
             )
-            """
-        )
+        else:
+            db.execute(
+                """
+                CREATE TABLE IF NOT EXISTS reservations (
+                    id            INTEGER PRIMARY KEY AUTOINCREMENT,
+                    event_date    TEXT    NOT NULL,
+                    day_name      TEXT    NOT NULL,
+                    slot_label    TEXT    NOT NULL,
+                    name          TEXT    NOT NULL,
+                    email         TEXT,
+                    phone         TEXT,
+                    purpose       TEXT    NOT NULL,
+                    num_people    INTEGER,
+                    comments      TEXT,
+                    status        TEXT    NOT NULL DEFAULT 'Pending',
+                    submitted_at  TEXT    NOT NULL,
+                    admin_note    TEXT
+                )
+                """
+            )
+            cols = {r[1] for r in db.execute("PRAGMA table_info(reservations)").fetchall()}
+            if "notify_status" not in cols:
+                db.execute("ALTER TABLE reservations ADD COLUMN notify_status TEXT")
+
         # One active (pending or reserved) request per date. Declined rows are
-        # ignored so a date frees up again if you turn a request down.
-        conn.execute(
+        # ignored so a date frees up again if you turn a request down. Both
+        # engines support partial unique indexes.
+        db.execute(
             """
             CREATE UNIQUE INDEX IF NOT EXISTS uniq_active_date
             ON reservations(event_date)
             WHERE status IN ('Pending', 'Reserved')
             """
         )
-        # Added later: records whether the automatic notification went out.
-        cols = {r[1] for r in conn.execute("PRAGMA table_info(reservations)")}
-        if "notify_status" not in cols:
-            conn.execute("ALTER TABLE reservations ADD COLUMN notify_status TEXT")
 
 
 def slot_for(d: date) -> dict | None:
@@ -141,17 +299,17 @@ def bookable_dates(start: date, end: date) -> list[date]:
     return out
 
 
-def status_map(start: date, end: date) -> dict[str, sqlite3.Row]:
+def status_map(start: date, end: date) -> dict[str, dict]:
     """Active reservations between two dates, keyed by ISO date string."""
-    with closing(get_conn()) as conn:
-        rows = conn.execute(
+    with Db() as db:
+        rows = db.fetchall(
             """
             SELECT * FROM reservations
             WHERE status IN ('Pending', 'Reserved')
               AND event_date BETWEEN ? AND ?
             """,
             (start.isoformat(), end.isoformat()),
-        ).fetchall()
+        )
     return {r["event_date"]: r for r in rows}
 
 
@@ -162,21 +320,29 @@ def month_bounds(d: date) -> tuple[str, str]:
     return first.isoformat(), last.isoformat()
 
 
-def active_count_in_month(d: date, conn: sqlite3.Connection | None = None) -> int:
+def active_count_in_month(d: date, db: "Db | None" = None) -> int:
     """How many pending or reserved bookings already sit in d's month."""
     first, last = month_bounds(d)
     sql = (
         "SELECT COUNT(*) FROM reservations "
         "WHERE status IN ('Pending', 'Reserved') AND event_date BETWEEN ? AND ?"
     )
-    if conn is not None:
-        return conn.execute(sql, (first, last)).fetchone()[0]
-    with closing(get_conn()) as c:
-        return c.execute(sql, (first, last)).fetchone()[0]
+    if db is not None:
+        return int(db.scalar(sql, (first, last)))
+    with Db() as own:
+        return int(own.scalar(sql, (first, last)))
 
 
 def month_is_full(d: date) -> bool:
     return active_count_in_month(d) >= MAX_PER_MONTH
+
+
+INSERT_SQL = """
+    INSERT INTO reservations
+        (event_date, day_name, slot_label, name, email, phone,
+         purpose, num_people, comments, status, submitted_at)
+    VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+"""
 
 
 def create_request(
@@ -195,27 +361,18 @@ def create_request(
         return False, "That date has already passed."
 
     row_id = None
-    with closing(get_conn()) as conn:
-        # BEGIN IMMEDIATE takes the write lock up front, so the count and the
-        # insert cannot be interleaved with another submission sneaking past
-        # the monthly cap.
-        conn.isolation_level = None
-        conn.execute("BEGIN IMMEDIATE")
-        try:
-            if active_count_in_month(event_date, conn) >= MAX_PER_MONTH:
-                conn.execute("ROLLBACK")
+    try:
+        with Db() as db:
+            # Lock first, then count, then insert, all in one transaction, so
+            # two simultaneous submissions cannot both pass the monthly cap.
+            db.lock_month(event_date)
+            if active_count_in_month(event_date, db) >= MAX_PER_MONTH:
                 return False, (
                     f"{event_date.strftime('%B %Y')} already has {MAX_PER_MONTH} reservations, "
                     "which is the limit for one month. Please choose a date in another month."
                 )
-
-            cur = conn.execute(
-                """
-                INSERT INTO reservations
-                    (event_date, day_name, slot_label, name, email, phone,
-                     purpose, num_people, comments, status, submitted_at)
-                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
-                """,
+            row_id = db.insert_returning_id(
+                INSERT_SQL,
                 (
                     event_date.isoformat(),
                     slot["day"],
@@ -230,17 +387,27 @@ def create_request(
                     datetime.now().isoformat(timespec="seconds"),
                 ),
             )
-            row_id = cur.lastrowid
-            conn.execute("COMMIT")
-        except sqlite3.IntegrityError:
-            conn.execute("ROLLBACK")
+    except Exception as exc:  # noqa: BLE001
+        if _is_integrity_error(exc):
             return False, "Sorry, that date was just taken. Please pick another one."
+        return False, f"Could not save the request: {exc}"
 
     # The reservation is safely stored. Notifying is best effort from here on,
     # so a mail problem can never cost someone their booking.
     if row_id is not None:
         notify_new_request(row_id)
     return True, "Request submitted."
+
+
+def _is_integrity_error(exc: Exception) -> bool:
+    if isinstance(exc, sqlite3.IntegrityError):
+        return True
+    try:
+        import psycopg2
+
+        return isinstance(exc, psycopg2.IntegrityError)
+    except Exception:
+        return False
 
 
 def all_reservations(statuses: tuple[str, ...] | None = None) -> pd.DataFrame:
@@ -250,13 +417,21 @@ def all_reservations(statuses: tuple[str, ...] | None = None) -> pd.DataFrame:
         query += " WHERE status IN (%s)" % ",".join("?" * len(statuses))
         params = statuses
     query += " ORDER BY event_date ASC, id ASC"
-    with closing(get_conn()) as conn:
-        return pd.read_sql_query(query, conn, params=params)
+    with Db() as db:
+        rows = db.fetchall(query, params)
+    cols = [
+        "id", "event_date", "day_name", "slot_label", "name", "email", "phone",
+        "purpose", "num_people", "comments", "status", "submitted_at",
+        "admin_note", "notify_status",
+    ]
+    if not rows:
+        return pd.DataFrame(columns=cols)
+    return pd.DataFrame([dict(r) for r in rows])
 
 
-def get_reservation(res_id: int) -> sqlite3.Row | None:
-    with closing(get_conn()) as conn:
-        return conn.execute("SELECT * FROM reservations WHERE id = ?", (res_id,)).fetchone()
+def get_reservation(res_id: int):
+    with Db() as db:
+        return db.fetchone("SELECT * FROM reservations WHERE id = ?", (res_id,))
 
 
 def set_status(res_id: int, status: str, note: str = "") -> tuple[bool, str]:
@@ -275,20 +450,21 @@ def set_status(res_id: int, status: str, note: str = "") -> tuple[bool, str]:
             )
 
     try:
-        with closing(get_conn()) as conn, conn:
-            conn.execute(
+        with Db() as db:
+            db.execute(
                 "UPDATE reservations SET status = ?, admin_note = ? WHERE id = ?",
                 (status, note, res_id),
             )
-    except sqlite3.IntegrityError:
-        return False, "Another active reservation already exists for that date."
+    except Exception as exc:  # noqa: BLE001
+        if _is_integrity_error(exc):
+            return False, "Another active reservation already exists for that date."
+        return False, f"Could not update: {exc}"
     return True, f"Updated to {status}."
 
 
 def delete_reservation(res_id: int) -> None:
-    with closing(get_conn()) as conn, conn:
-        conn.execute("DELETE FROM reservations WHERE id = ?", (res_id,))
-
+    with Db() as db:
+        db.execute("DELETE FROM reservations WHERE id = ?", (res_id,))
 
 # --------------------------------------------------------------------------
 # Calendar rendering
@@ -865,6 +1041,15 @@ def page_admin() -> None:
     if top[3].button("Sign out"):
         st.session_state["admin_ok"] = False
         st.rerun()
+
+    if using_postgres():
+        st.caption("Storage: Supabase Postgres. Reservations survive restarts and redeploys.")
+    else:
+        st.warning(
+            "Storage: a local SQLite file. On Streamlit Community Cloud this disk is temporary, "
+            "so reservations are lost whenever the app sleeps or redeploys. Add `postgres_url` "
+            "to your secrets to store them permanently."
+        )
 
     if not app_password():
         st.warning(

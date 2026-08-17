@@ -27,6 +27,11 @@ check("unset returns None", app.app_password() is None)
 # end to end: the exact string from the screenshot must now log in cleanly
 os.environ["GMAIL_APP_PASSWORD"] = "rjcb\xa0pgpf ctyl sltm"
 import importlib; importlib.reload(app); app.init_db()
+
+# Start from a clean table. With SQLite each run gets its own temp file, but a
+# shared Postgres keeps rows between test files, so clear it explicitly.
+with app.Db() as _db:
+    _db.execute("DELETE FROM reservations")
 sent = []
 class Fake:
     def __init__(s,h,p,timeout=None): pass

@@ -74,7 +74,61 @@ Alternatively set the `CALVARY_ADMIN_PASSWORD` environment variable, which takes
 
 ### Data
 
-Everything lives in `reservations.db`, a SQLite file created next to `app.py` on first run. Back it up by copying that one file. To store it elsewhere, set the `CALVARY_DB` environment variable to the path you want.
+Two storage backends, chosen automatically:
+
+- **Postgres**, when a `postgres_url` secret is present. Use this for anything deployed. Data survives restarts, sleeps and redeploys.
+- **SQLite**, otherwise. A `reservations.db` file next to `app.py`, created on first run. Fine for local use and for trying the app out. Move it elsewhere with the `CALVARY_DB` environment variable.
+
+The Admin page always states which one is live, and warns you if a deployed app is still on SQLite.
+
+## Setting up Supabase Postgres
+
+Streamlit Community Cloud gives each app a temporary disk and puts apps to sleep after 12 hours without traffic. When an app wakes it is rebuilt from the repo, so a SQLite file written at runtime is gone and every reservation with it. Postgres fixes this permanently.
+
+1. Sign up at [supabase.com](https://supabase.com) and create a project. The free tier is enough for this by a wide margin. Save the database password it asks you to set.
+2. In the project, open **Connect** (top of the dashboard).
+3. Choose the **Session pooler** connection string, not "Direct connection". Direct connections are IPv6-only on new Supabase projects and Streamlit Cloud cannot reach them. The pooler URI works over IPv4.
+4. It looks like this, with a placeholder where your password goes:
+
+   ```
+   postgresql://postgres.abcdefgh:[YOUR-PASSWORD]@aws-0-us-east-1.pooler.supabase.com:5432/postgres
+   ```
+
+   Replace `[YOUR-PASSWORD]` with the database password from step 1. The app refuses a string that still contains the placeholder rather than failing later with a confusing authentication error.
+
+5. Add it to your secrets, locally in `.streamlit/secrets.toml` and on Streamlit Cloud in *Settings, Secrets*:
+
+   ```toml
+   admin_password = "your-admin-password"
+   gmail_app_password = "your-gmail-app-password"
+   postgres_url = "postgresql://postgres.abcdefgh:realpassword@aws-0-us-east-1.pooler.supabase.com:5432/postgres"
+   ```
+
+6. Restart the app. The table is created automatically on first run, and the Admin page will report "Storage: Supabase Postgres".
+
+### Moving existing reservations across
+
+If you already have bookings in `reservations.db`:
+
+```bash
+POSTGRES_URL="postgresql://..." python3 migrate_to_postgres.py --dry-run   # preview
+POSTGRES_URL="postgresql://..." python3 migrate_to_postgres.py            # apply
+```
+
+It skips rows already present, so running it twice is harmless.
+
+### About sleeping
+
+Postgres does not stop the app from hibernating after 12 hours of no traffic; it stops hibernation from destroying data. A sleeping app shows a wake button that **anyone** viewing can click, and it is back in about 30 seconds with every reservation intact. If the wake screen itself is a problem, a scheduled job that visits the URL every few hours keeps it awake, or a host without hibernation removes the issue entirely.
+
+## Running the tests
+
+```bash
+./run_tests.sh                                          # against SQLite
+POSTGRES_URL="postgresql://..." ./run_tests.sh          # against Postgres
+```
+
+Covers the booking rules, the monthly cap, email drafting and encoding, app password sanitising, and six simultaneous submissions racing for one remaining slot.
 
 ## Deploying so others can reach it
 

@@ -4,6 +4,11 @@ os.environ.pop("GMAIL_APP_PASSWORD", None)
 import app
 app.init_db()
 
+# Start from a clean table. With SQLite each run gets its own temp file, but a
+# shared Postgres keeps rows between test files, so clear it explicitly.
+with app.Db() as _db:
+    _db.execute("DELETE FROM reservations")
+
 def nw(wd, weeks=0):
     d = dt.date.today() + dt.timedelta(days=1)
     while d.weekday() != wd: d += dt.timedelta(days=1)

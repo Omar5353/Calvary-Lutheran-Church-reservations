@@ -6,6 +6,11 @@ import app  # noqa: E402
 
 app.init_db()
 
+# Start from a clean table. With SQLite each run gets its own temp file, but a
+# shared Postgres keeps rows between test files, so clear it explicitly.
+with app.Db() as _db:
+    _db.execute("DELETE FROM reservations")
+
 def next_weekday(wd, offset_weeks=0):
     d = dt.date.today() + dt.timedelta(days=1)
     while d.weekday() != wd:
