@@ -299,18 +299,50 @@ def bookable_dates(start: date, end: date) -> list[date]:
     return out
 
 
-def status_map(start: date, end: date) -> dict[str, dict]:
+def status_map(start: date, end: date, db: "Db | None" = None) -> dict[str, dict]:
     """Active reservations between two dates, keyed by ISO date string."""
-    with Db() as db:
-        rows = db.fetchall(
-            """
-            SELECT * FROM reservations
-            WHERE status IN ('Pending', 'Reserved')
-              AND event_date BETWEEN ? AND ?
-            """,
-            (start.isoformat(), end.isoformat()),
-        )
+    sql = """
+        SELECT * FROM reservations
+        WHERE status IN ('Pending', 'Reserved')
+          AND event_date BETWEEN ? AND ?
+    """
+    params = (start.isoformat(), end.isoformat())
+    if db is not None:
+        rows = db.fetchall(sql, params)
+    else:
+        with Db() as own:
+            rows = own.fetchall(sql, params)
     return {r["event_date"]: r for r in rows}
+
+
+def month_counts(start: date, end: date, db: "Db | None" = None) -> dict[tuple[int, int], int]:
+    """
+    Active bookings per calendar month, as {(year, month): count}, in a single
+    query.
+
+    This replaces asking the database once per candidate date, which meant
+    roughly 80 round trips to build one page and made the request form crawl
+    on a remote database.
+    """
+    sql = """
+        SELECT substr(event_date, 1, 7) AS ym, COUNT(*) AS n
+        FROM reservations
+        WHERE status IN ('Pending', 'Reserved')
+          AND event_date BETWEEN ? AND ?
+        GROUP BY substr(event_date, 1, 7)
+    """
+    params = (start.isoformat(), end.isoformat())
+    if db is not None:
+        rows = db.fetchall(sql, params)
+    else:
+        with Db() as own:
+            rows = own.fetchall(sql, params)
+
+    out: dict[tuple[int, int], int] = {}
+    for r in rows:
+        y, m = str(r["ym"]).split("-")[:2]
+        out[(int(y), int(m))] = int(r["n"])
+    return out
 
 
 def month_bounds(d: date) -> tuple[str, str]:
@@ -610,10 +642,15 @@ def render_calendar(show_details: bool, key: str) -> None:
     year, month = month_picker(key)
     first = date(year, month, 1)
     last = date(year, month, pycalendar.monthrange(year, month)[1])
-    used = active_count_in_month(first)
+
+    # One connection, two queries, for the whole grid.
+    with Db() as db:
+        taken = status_map(first, last, db)
+        used = month_counts(first, last, db).get((year, month), 0)
+
     st.caption(f"{used} of {MAX_PER_MONTH} reservations used in {pycalendar.month_name[month]} {year}")
     st.markdown(
-        month_html(year, month, status_map(first, last), show_details, month_full=used >= MAX_PER_MONTH),
+        month_html(year, month, taken, show_details, month_full=used >= MAX_PER_MONTH),
         unsafe_allow_html=True,
     )
 
@@ -838,13 +875,18 @@ def page_request() -> None:
 
     today = date.today()
     horizon = today + timedelta(days=31 * MONTHS_AHEAD)
-    taken = status_map(today, horizon)
 
-    full_months = set()
-    for d in bookable_dates(today, horizon):
-        ym = (d.year, d.month)
-        if ym not in full_months and month_is_full(d):
-            full_months.add(ym)
+    # Two queries on one connection for the whole page: which dates are taken,
+    # and how many bookings each month already holds.
+    # Count whole calendar months, so a booking late in the final month is not
+    # missed just because the browsing horizon lands mid-month.
+    horizon_end = horizon.replace(day=pycalendar.monthrange(horizon.year, horizon.month)[1])
+
+    with Db() as db:
+        taken = status_map(today, horizon, db)
+        counts = month_counts(today.replace(day=1), horizon_end, db)
+
+    full_months = {ym for ym, n in counts.items() if n >= MAX_PER_MONTH}
 
     open_dates = [
         d
@@ -925,7 +967,7 @@ def page_request() -> None:
         st.error(blocker)
     else:
         blocker = None
-        left = MAX_PER_MONTH - active_count_in_month(chosen)
+        left = MAX_PER_MONTH - counts.get((chosen.year, chosen.month), 0)
         st.success(
             f"**{chosen.strftime('%A, %B %d, %Y')}**, {picked_slot['label']} is open. "
             f"{left} of {MAX_PER_MONTH} reservations remaining in {chosen.strftime('%B')}. "

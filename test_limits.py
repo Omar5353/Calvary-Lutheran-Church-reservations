@@ -72,4 +72,26 @@ check("next month still open", ok6)
 # notification is skipped without a password, and does not break the booking
 row = app.get_reservation(int(app.all_reservations()["id"].iloc[-1]))
 check("notify recorded as not configured", row["notify_status"] == "not configured")
-print("\nCap tests passed.")
+# ---- month_counts must agree with the per-month count it replaced ----
+print()
+import calendar as _cal
+probe = dt.date.today().replace(day=1)
+end = (probe + dt.timedelta(days=31*7))
+end = end.replace(day=_cal.monthrange(end.year, end.month)[1])
+counts = app.month_counts(probe, end)
+agree = True
+d = probe
+seen = set()
+while d <= end:
+    ym = (d.year, d.month)
+    if ym not in seen:
+        seen.add(ym)
+        if counts.get(ym, 0) != app.active_count_in_month(d):
+            agree = False
+            print(f"     mismatch for {ym}: batched={counts.get(ym,0)} per-month={app.active_count_in_month(d)}")
+    d += dt.timedelta(days=28)
+check("batched month counts match per-month counts", agree)
+check("months with no bookings are absent, not zero-filled",
+      all(v > 0 for v in counts.values()))
+
+print("\nAll checks passed.")
