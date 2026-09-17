@@ -20,6 +20,32 @@ os.environ["NOTIFY_EMAIL"] = "5353murad@gmail.com"
 os.environ["ADMIN_PASSWORD"] = "test-admin-password"
 MAIL = os.environ.get("MAILBOX", "/tmp/mail.json")
 
+def _ensure_catcher(host="127.0.0.1", port=8025):
+    """Start the capture server if it is not already listening."""
+    import socket, subprocess, sys, time, os
+    s = socket.socket(); s.settimeout(1)
+    try:
+        s.connect((host, port)); s.close(); return None
+    except Exception:
+        pass
+    proc = subprocess.Popen(
+        [sys.executable, os.path.join(os.path.dirname(os.path.abspath(__file__)), "mailcatcher.py"),
+         str(port), os.environ.get("MAILBOX", "/tmp/mail.json")],
+        stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL,
+    )
+    for _ in range(50):
+        try:
+            s = socket.socket(); s.settimeout(1); s.connect((host, port)); s.close()
+            return proc
+        except Exception:
+            time.sleep(0.1)
+    raise RuntimeError("could not start mailcatcher on port %d" % port)
+
+
+_CATCHER = _ensure_catcher()
+import atexit
+atexit.register(lambda: _CATCHER and _CATCHER.terminate())
+
 import app  # noqa: E402
 
 app.init_db()
@@ -66,8 +92,10 @@ ok, _ = app.create_request(day, "Maria Lopez", REQUESTER, "402-555-0101",
                            "Quinceanera reception", 120, "Kitchen and A/V needed")
 check("request accepted", ok)
 
-box = mailbox(expect=2)
-check("two emails went out on submission", len(box) == 2)
+box = mailbox(expect=3)
+check("three emails went out on submission", len(box) == 3)
+check("the requester got an acknowledgement",
+      len([m for m in box if REQUESTER in m["to"][0]]) == 1)
 office = [m for m in box if app.office_email() in m["to"]]
 owner = [m for m in box if app.notify_email() in m["to"]]
 check("one addressed to the trial office inbox", len(office) == 1)

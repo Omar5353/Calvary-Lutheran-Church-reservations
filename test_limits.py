@@ -35,8 +35,15 @@ print("Testing month:", target_month, "candidates:", [str(c) for c in cands])
 ok1,_ = app.create_request(cands[0], "A", "a@x.org", "", "P1", 10, "")
 ok2,_ = app.create_request(cands[1], "B", "b@x.org", "", "P2", 10, "")
 check("first two accepted", ok1 and ok2)
-check("count is 2", app.active_count_in_month(cands[0]) == 2)
-check("month reports full", app.month_is_full(cands[0]))
+check("two pending in the month", app.pending_count_in_month(cands[0]) == 2)
+check("pending alone does NOT fill the month", not app.month_is_full(cands[0]))
+
+# only approvals count toward the limit
+for nm in ("A", "B"):
+    rid = int(app.all_reservations()[app.all_reservations()["name"] == nm]["id"].iloc[0])
+    app.set_status(rid, app.STATUS_RESERVED)
+check("two approved", app.reserved_count_in_month(cands[0]) == 2)
+check("month reports full once approved", app.month_is_full(cands[0]))
 
 ok3, msg3 = app.create_request(cands[2], "C", "c@x.org", "", "P3", 10, "")
 check("third rejected", not ok3)
@@ -46,16 +53,18 @@ print("     msg:", msg3)
 # decline one -> a slot frees up
 rid = int(app.all_reservations()["id"].iloc[0])
 app.set_status(rid, app.STATUS_DECLINED, "conflict")
-check("count back to 1", app.active_count_in_month(cands[0]) == 1)
+check("count back to 1", app.reserved_count_in_month(cands[0]) == 1)
 check("month no longer full", not app.month_is_full(cands[0]))
 ok4,_ = app.create_request(cands[2], "C", "c@x.org", "", "P3", 10, "")
 check("third accepted after decline", ok4)
-check("count is 2 again", app.active_count_in_month(cands[0]) == 2)
+rid_c = int(app.all_reservations()[app.all_reservations()["name"] == "C"]["id"].iloc[0])
+app.set_status(rid_c, app.STATUS_RESERVED)
+check("count is 2 again", app.reserved_count_in_month(cands[0]) == 2)
 
 # re-approving the declined one must not exceed the cap
 ok5, msg5 = app.set_status(rid, app.STATUS_RESERVED)
 check("re-approve blocked at cap", not ok5)
-check("re-approve message explains", "already has 2 active" in msg5)
+check("re-approve message explains", "already has 2 approved" in msg5)
 print("     msg:", msg5)
 
 # next month is unaffected
@@ -86,12 +95,15 @@ while d <= end:
     ym = (d.year, d.month)
     if ym not in seen:
         seen.add(ym)
-        if counts.get(ym, 0) != app.active_count_in_month(d):
+        batched = counts.get(ym, {"reserved": 0, "pending": 0})
+        if (batched["reserved"] != app.reserved_count_in_month(d)
+                or batched["pending"] != app.pending_count_in_month(d)):
             agree = False
-            print(f"     mismatch for {ym}: batched={counts.get(ym,0)} per-month={app.active_count_in_month(d)}")
+            print(f"     mismatch for {ym}: batched={batched} "
+                  f"per-month=({app.reserved_count_in_month(d)}, {app.pending_count_in_month(d)})")
     d += dt.timedelta(days=28)
 check("batched month counts match per-month counts", agree)
 check("months with no bookings are absent, not zero-filled",
-      all(v > 0 for v in counts.values()))
+      all(v["reserved"] + v["pending"] > 0 for v in counts.values()))
 
 print("\nAll checks passed.")

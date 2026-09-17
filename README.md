@@ -28,16 +28,17 @@ One event per date. Mon-Thu are shown as not bookable.
 
 ## Approve or decline from the email
 
-When a request is submitted the app sends two emails immediately:
+When a request is submitted the app sends three emails immediately:
 
-1. **To you**, a heads-up with the details.
-2. **To the church office** (`EMAIL_TO`), the same details plus **Approve** and **Decline** buttons.
+1. **To the requester**, confirming it arrived and stating clearly that it is a request, not a booking, and the date is not theirs until the office approves.
+2. **To you**, a heads-up with the details and where the month stands.
+3. **To the church office** (`EMAIL_TO`), the same details plus **Approve** and **Decline** buttons.
 
 Pressing either button opens a small page in the app showing the request, with one confirmation button. Nothing changes until that is pressed. This matters because mail scanners, link previewers and some corporate security products fetch every URL in an incoming message; if the link itself decided the outcome, a booking could be approved before anyone read it.
 
 On confirming:
 
-- **Approve** marks the date Reserved on the calendar, emails the requester that they are confirmed, and emails you.
+- **Approve** marks the date Reserved on the calendar, emails the requester that they are confirmed, and emails you. Blocked if the month already holds the limit.
 - **Decline** frees the date for others, and emails the requester including the line *"Book another day, or please reserve any other day or other weekend."* plus a link back to the scheduler. You are emailed too.
 
 The Approve and Decline buttons on the Admin page do exactly the same thing through the same code path, so the two routes cannot drift apart.
@@ -71,9 +72,17 @@ DEFAULT_BASE_URL = "https://calvary-lutheran-church-reservations.streamlit.app"
 
 ## Monthly limit
 
-At most **2 active reservations per calendar month**, set by `MAX_PER_MONTH` in `app.py`. Pending counts toward the limit, the same as Reserved, so two unreviewed requests close the month until you act on one. Declining frees the slot immediately and the month reopens.
+At most **2 approved reservations per calendar month**, set by `MAX_PER_MONTH` in `app.py`.
 
-When a month is full, its remaining dates are dropped from the date picker, the calendar greys them out and labels them "Month full", and the request form refuses to submit if someone types the date in by hand. The check also runs inside the database transaction, so two people submitting at the same instant cannot both slip through. Re-approving a previously declined request is blocked too if the month has since filled up.
+Only **approved** bookings count toward the limit. Pending requests appear on the calendar in amber and are visible to everyone, but they do not close the month, so several people can have requests in for the same month while the office works through them. A request nobody has reviewed yet can never lock everyone else out.
+
+The month fills when approvals reach the limit. At that point its remaining dates grey out as "Month full", drop off the date picker, and new requests are refused. Declining an approved booking reopens the month immediately; declining a pending one simply frees that date.
+
+Once a month is full, any leftover pending requests for it cannot be approved. The office is told to decline one of the existing approvals first, rather than being allowed to go over quietly.
+
+Both checks run inside a locked transaction, so simultaneous requests cannot skip the date check and simultaneous approvals cannot both take the last place.
+
+The calendar caption states the position plainly: *"1 of 2 approved in September 2026, 3 awaiting a decision"*.
 
 ## Automatic email notification
 

@@ -14,7 +14,7 @@ CATCHER=$!
 sleep 2
 
 fail=0
-for t in test_smoke test_limits test_notify test_pw test_concurrency test_approval; do
+for t in test_smoke test_limits test_notify test_pw test_concurrency test_approval test_pending_flow; do
   if out=$(python3 "$t.py" 2>&1) && ! grep -q "FAIL" <<<"$out"; then
     printf '  %-18s ok\n' "$t"
   else

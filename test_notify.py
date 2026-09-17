@@ -31,7 +31,14 @@ check("request accepted", ok)
 check("connected to gmail", ("connect", "smtp.gmail.com", 465) in sent)
 check("logged in as the right account", ("login", "5353murad@gmail.com", "fake-app-password") in sent)
 
-msg = [s[1] for s in sent if s[0] == "msg"][0]
+msgs = [s[1] for s in sent if s[0] == "msg"]
+check("three emails leave on submission (requester, organiser, office)", len(msgs) == 3)
+check("the requester is acknowledged",
+      any(m["To"] == "maria@example.org" for m in msgs))
+check("the office is asked to decide",
+      any(m["To"] == app.office_email() for m in msgs))
+
+msg = [m for m in msgs if m["To"] == "5353murad@gmail.com"][0]   # the organiser copy
 check("to the notify address", msg["To"] == "5353murad@gmail.com")
 check("reply-to is the requester", msg["Reply-To"] == "maria@example.org")
 body = msg.get_content()
@@ -40,7 +47,7 @@ check("body has name", "Maria Lopez" in body)
 check("body has purpose", "Quinceanera reception" in body)
 check("body has headcount", "120" in body)
 check("body has comments", "Kitchen and A/V" in body)
-check("body shows month usage", "1 of 2 allowed" in body)
+check("body shows month usage", "0 of 2 approved" in body and "1 awaiting" in body)
 
 row = app.get_reservation(int(app.all_reservations()["id"].iloc[0]))
 check("db records the send", row["notify_status"].startswith("sent "))

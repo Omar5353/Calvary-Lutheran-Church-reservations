@@ -257,7 +257,8 @@ def init_db() -> None:
                     admin_note    TEXT,
                     notify_status TEXT,
                     office_status TEXT,
-                    decision_emails TEXT
+                    decision_emails TEXT,
+                    ack_status TEXT
                 )
                 """
             )
@@ -282,12 +283,12 @@ def init_db() -> None:
                 """
             )
             cols = {r[1] for r in db.execute("PRAGMA table_info(reservations)").fetchall()}
-            for col in ("notify_status", "office_status", "decision_emails"):
+            for col in ("notify_status", "office_status", "decision_emails", "ack_status"):
                 if col not in cols:
                     db.execute(f"ALTER TABLE reservations ADD COLUMN {col} TEXT")
 
         if db.pg:
-            for col in ("office_status", "decision_emails"):
+            for col in ("office_status", "decision_emails", "ack_status"):
                 db.execute(f"ALTER TABLE reservations ADD COLUMN IF NOT EXISTS {col} TEXT")
 
         # One active (pending or reserved) request per date. Declined rows are
@@ -331,21 +332,31 @@ def status_map(start: date, end: date, db: "Db | None" = None) -> dict[str, dict
     return {r["event_date"]: r for r in rows}
 
 
-def month_counts(start: date, end: date, db: "Db | None" = None) -> dict[tuple[int, int], int]:
-    """
-    Active bookings per calendar month, as {(year, month): count}, in a single
-    query.
+def month_bounds(d: date) -> tuple[str, str]:
+    """First and last day of d's calendar month, as ISO strings."""
+    first = d.replace(day=1)
+    last = d.replace(day=pycalendar.monthrange(d.year, d.month)[1])
+    return first.isoformat(), last.isoformat()
 
-    This replaces asking the database once per candidate date, which meant
-    roughly 80 round trips to build one page and made the request form crawl
-    on a remote database.
+
+def month_counts(start: date, end: date, db: "Db | None" = None) -> dict[tuple[int, int], dict]:
+    """
+    Per calendar month, how many bookings are approved and how many are still
+    waiting, as {(year, month): {"reserved": n, "pending": n}}, in one query.
+
+    Only approved bookings count toward the monthly limit. Requests that are
+    still pending are shown on the calendar but do not close the month, so a
+    request nobody has reviewed yet cannot lock everyone else out.
+
+    One query rather than one per candidate date: that used to be roughly 80
+    round trips to build a single page.
     """
     sql = """
-        SELECT substr(event_date, 1, 7) AS ym, COUNT(*) AS n
+        SELECT substr(event_date, 1, 7) AS ym, status, COUNT(*) AS n
         FROM reservations
         WHERE status IN ('Pending', 'Reserved')
           AND event_date BETWEEN ? AND ?
-        GROUP BY substr(event_date, 1, 7)
+        GROUP BY substr(event_date, 1, 7), status
     """
     params = (start.isoformat(), end.isoformat())
     if db is not None:
@@ -354,35 +365,42 @@ def month_counts(start: date, end: date, db: "Db | None" = None) -> dict[tuple[i
         with Db() as own:
             rows = own.fetchall(sql, params)
 
-    out: dict[tuple[int, int], int] = {}
+    out: dict[tuple[int, int], dict] = {}
     for r in rows:
         y, m = str(r["ym"]).split("-")[:2]
-        out[(int(y), int(m))] = int(r["n"])
+        key = (int(y), int(m))
+        slot = out.setdefault(key, {"reserved": 0, "pending": 0})
+        slot["reserved" if r["status"] == STATUS_RESERVED else "pending"] += int(r["n"])
     return out
 
 
-def month_bounds(d: date) -> tuple[str, str]:
-    """First and last day of d's calendar month, as ISO strings."""
-    first = d.replace(day=1)
-    last = d.replace(day=pycalendar.monthrange(d.year, d.month)[1])
-    return first.isoformat(), last.isoformat()
+def _count_in_month(d: date, status: str, db: "Db | None" = None) -> int:
+    first, last = month_bounds(d)
+    sql = "SELECT COUNT(*) FROM reservations WHERE status = ? AND event_date BETWEEN ? AND ?"
+    if db is not None:
+        return int(db.scalar(sql, (status, first, last)))
+    with Db() as own:
+        return int(own.scalar(sql, (status, first, last)))
+
+
+def reserved_count_in_month(d: date, db: "Db | None" = None) -> int:
+    """Approved bookings in d's month. This is what the monthly limit counts."""
+    return _count_in_month(d, STATUS_RESERVED, db)
+
+
+def pending_count_in_month(d: date, db: "Db | None" = None) -> int:
+    """Requests in d's month still waiting on the office."""
+    return _count_in_month(d, STATUS_PENDING, db)
 
 
 def active_count_in_month(d: date, db: "Db | None" = None) -> int:
-    """How many pending or reserved bookings already sit in d's month."""
-    first, last = month_bounds(d)
-    sql = (
-        "SELECT COUNT(*) FROM reservations "
-        "WHERE status IN ('Pending', 'Reserved') AND event_date BETWEEN ? AND ?"
-    )
-    if db is not None:
-        return int(db.scalar(sql, (first, last)))
-    with Db() as own:
-        return int(own.scalar(sql, (first, last)))
+    """Approved plus pending, for display."""
+    return reserved_count_in_month(d, db) + pending_count_in_month(d, db)
 
 
 def month_is_full(d: date) -> bool:
-    return active_count_in_month(d) >= MAX_PER_MONTH
+    """A month is full only once the limit is reached by APPROVED bookings."""
+    return reserved_count_in_month(d) >= MAX_PER_MONTH
 
 
 INSERT_SQL = """
@@ -414,9 +432,9 @@ def create_request(
             # Lock first, then count, then insert, all in one transaction, so
             # two simultaneous submissions cannot both pass the monthly cap.
             db.lock_month(event_date)
-            if active_count_in_month(event_date, db) >= MAX_PER_MONTH:
+            if reserved_count_in_month(event_date, db) >= MAX_PER_MONTH:
                 return False, (
-                    f"{event_date.strftime('%B %Y')} already has {MAX_PER_MONTH} reservations, "
+                    f"{event_date.strftime('%B %Y')} already has {MAX_PER_MONTH} approved reservations, "
                     "which is the limit for one month. Please choose a date in another month."
                 )
             row_id = db.insert_returning_id(
@@ -443,7 +461,8 @@ def create_request(
     # The reservation is safely stored. Notifying is best effort from here on,
     # so a mail problem can never cost someone their booking.
     if row_id is not None:
-        notify_new_request(row_id)       # heads-up to the organiser
+        send_requester_ack(row_id)         # "we got it, it is pending"
+        notify_new_request(row_id)         # heads-up to the organiser
         send_office_request_email(row_id)  # the one with Approve / Decline buttons
     return True, "Request submitted."
 
@@ -471,7 +490,7 @@ def all_reservations(statuses: tuple[str, ...] | None = None) -> pd.DataFrame:
     cols = [
         "id", "event_date", "day_name", "slot_label", "name", "email", "phone",
         "purpose", "num_people", "comments", "status", "submitted_at",
-        "admin_note", "notify_status", "office_status", "decision_emails",
+        "admin_note", "notify_status", "office_status", "decision_emails", "ack_status",
     ]
     if not rows:
         return pd.DataFrame(columns=cols)
@@ -484,22 +503,32 @@ def get_reservation(res_id: int):
 
 
 def set_status(res_id: int, status: str, note: str = "") -> tuple[bool, str]:
+    """
+    Change one reservation's status.
+
+    Approving is the contended operation now that only approvals count toward
+    the monthly limit: several pending requests can exist for a month with one
+    place left, and two people approving at the same moment must not both get
+    in. So the limit is re-checked inside a locked transaction, the same way a
+    new request is.
+    """
     row = get_reservation(res_id)
     if row is None:
         return False, "That reservation no longer exists."
 
     d = datetime.fromisoformat(row["event_date"]).date()
-
-    # Bringing a declined request back to life must respect the monthly cap.
-    if status in ACTIVE_STATUSES and row["status"] not in ACTIVE_STATUSES:
-        if active_count_in_month(d) >= MAX_PER_MONTH:
-            return False, (
-                f"{d.strftime('%B %Y')} already has {MAX_PER_MONTH} active reservations. "
-                "Decline one of those first."
-            )
+    approving = status == STATUS_RESERVED and row["status"] != STATUS_RESERVED
 
     try:
         with Db() as db:
+            if approving:
+                db.lock_month(d)
+                if reserved_count_in_month(d, db) >= MAX_PER_MONTH:
+                    return False, (
+                        f"{d.strftime('%B %Y')} already has {MAX_PER_MONTH} approved "
+                        "reservations, which is the limit. Decline one of those before "
+                        "approving this."
+                    )
             db.execute(
                 "UPDATE reservations SET status = ?, admin_note = ? WHERE id = ?",
                 (status, note, res_id),
@@ -663,9 +692,13 @@ def render_calendar(show_details: bool, key: str) -> None:
     # One connection, two queries, for the whole grid.
     with Db() as db:
         taken = status_map(first, last, db)
-        used = month_counts(first, last, db).get((year, month), 0)
+        c = month_counts(first, last, db).get((year, month), {"reserved": 0, "pending": 0})
+    used, waiting = c["reserved"], c["pending"]
 
-    st.caption(f"{used} of {MAX_PER_MONTH} reservations used in {pycalendar.month_name[month]} {year}")
+    label = f"{used} of {MAX_PER_MONTH} approved in {pycalendar.month_name[month]} {year}"
+    if waiting:
+        label += f", {waiting} awaiting a decision"
+    st.caption(label)
     st.markdown(
         month_html(year, month, taken, show_details, month_full=used >= MAX_PER_MONTH),
         unsafe_allow_html=True,
@@ -808,7 +841,8 @@ def notify_new_request(res_id: int) -> tuple[bool, str]:
     lines += [
         f"Submitted:         {str(row['submitted_at']).replace('T', ' ')}",
         "",
-        f"This month now holds {active_count_in_month(d)} of {MAX_PER_MONTH} allowed reservations.",
+        f"{d.strftime('%B %Y')}: {reserved_count_in_month(d)} of {MAX_PER_MONTH} approved, "
+        f"{pending_count_in_month(d)} awaiting a decision.",
         "",
         f"The office has been emailed with Approve and Decline buttons. You will get "
         f"another message once {EMAIL_GREETING_NAME or 'the office'} decides.",
@@ -1033,6 +1067,78 @@ color:#111;line-height:1.55;max-width:600px">
   <p>Thank you,<br>{EMAIL_SIGNOFF}</p>
 </body></html>"""
     return subject, text, html
+
+
+def send_requester_ack(res_id: int) -> tuple[bool, str]:
+    """
+    Tell the requester we have their request.
+
+    Sent the moment they submit, so nobody is left wondering whether the form
+    worked. It is careful to promise nothing: the date is not theirs until the
+    office approves it.
+    """
+    row = get_reservation(res_id)
+    if row is None:
+        return False, "Reservation not found."
+    if not row["email"]:
+        with closing_note(res_id, "ack_status", "no email given"):
+            pass
+        return False, "No requester email."
+
+    d = datetime.fromisoformat(row["event_date"]).date()
+    pretty = d.strftime("%A, %B %d, %Y")
+
+    text = f"""Dear {row['name']},
+
+Thank you. We have received your request to use {CHURCH_NAME}, and it is now
+waiting for the church office to review.
+
+Date:              {pretty}
+Time:              {row['slot_label']}
+Purpose:           {row['purpose']}
+Number attending:  {row['num_people']}
+
+Please note this is a request, not a confirmed booking. The date is held as
+pending and is not yours until the office approves it. You will get another
+email either way, usually within a few days.
+
+If you need to change or withdraw the request, simply reply to this message.
+
+Kind regards,
+{EMAIL_SIGNOFF}
+{CHURCH_NAME}
+"""
+
+    rows_html = "".join(
+        f'<tr><td style="padding:4px 16px 4px 0;color:#666">{k}</td>'
+        f'<td style="padding:4px 0"><b>{v}</b></td></tr>'
+        for k, v in [
+            ("Date", pretty), ("Time", row["slot_label"]),
+            ("Purpose", row["purpose"]), ("Number attending", row["num_people"]),
+        ]
+    )
+    html = f"""<html><body style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;
+color:#111;line-height:1.55;max-width:600px">
+<p>Dear {row['name']},</p>
+<p>Thank you. We have received your request to use {CHURCH_NAME}, and it is now
+waiting for the church office to review.</p>
+<table style="border-collapse:collapse;font-size:15px;margin:16px 0">{rows_html}</table>
+<p style="background:#fff4e0;border-left:4px solid #b26a00;padding:11px 14px;margin:18px 0">
+<b>This is a request, not a confirmed booking.</b> The date is held as pending and is
+not yours until the office approves it. You will get another email either way,
+usually within a few days.</p>
+<p>If you need to change or withdraw the request, simply reply to this message.</p>
+<p>Kind regards,<br>{EMAIL_SIGNOFF}<br>{CHURCH_NAME}</p>
+</body></html>"""
+
+    ok, msg = send_email(
+        row["email"],
+        f"We received your request for {pretty}, {CHURCH_NAME}",
+        text, html=html, reply_to=notify_email(),
+    )
+    with closing_note(res_id, "ack_status", "sent" if ok else f"failed: {msg[:60]}"):
+        pass
+    return ok, msg
 
 
 def send_office_request_email(res_id: int) -> tuple[bool, str]:
@@ -1265,7 +1371,7 @@ def page_request() -> None:
         taken = status_map(today, horizon, db)
         counts = month_counts(today.replace(day=1), horizon_end, db)
 
-    full_months = {ym for ym, n in counts.items() if n >= MAX_PER_MONTH}
+    full_months = {ym for ym, c in counts.items() if c["reserved"] >= MAX_PER_MONTH}
 
     open_dates = [
         d
@@ -1276,7 +1382,8 @@ def page_request() -> None:
     if not open_dates:
         st.warning(
             "There are no open dates in the next few months. Every month is either fully "
-            f"booked or already at the limit of {MAX_PER_MONTH} reservations. Please check back later."
+            f"booked or already at the limit of {MAX_PER_MONTH} approved reservations. "
+            "Please check back later."
         )
         availability_section()
         return
@@ -1340,17 +1447,23 @@ def page_request() -> None:
         st.error(blocker)
     elif (chosen.year, chosen.month) in full_months:
         blocker = (
-            f"**{chosen.strftime('%B %Y')}** already has {MAX_PER_MONTH} reservations, which is "
+            f"**{chosen.strftime('%B %Y')}** already has {MAX_PER_MONTH} approved reservations, which is "
             "the limit for one month. Please pick a date in a different month."
         )
         st.error(blocker)
     else:
         blocker = None
-        left = MAX_PER_MONTH - counts.get((chosen.year, chosen.month), 0)
+        c = counts.get((chosen.year, chosen.month), {"reserved": 0, "pending": 0})
+        left = MAX_PER_MONTH - c["reserved"]
+        note = (
+            f"{left} of {MAX_PER_MONTH} places left in {chosen.strftime('%B')}"
+            if not c["pending"]
+            else f"{left} of {MAX_PER_MONTH} places left in {chosen.strftime('%B')}, with "
+                 f"{c['pending']} other request{'s' if c['pending'] > 1 else ''} awaiting a decision"
+        )
         st.success(
             f"**{chosen.strftime('%A, %B %d, %Y')}**, {picked_slot['label']} is open. "
-            f"{left} of {MAX_PER_MONTH} reservations remaining in {chosen.strftime('%B')}. "
-            "Fill out the details below."
+            f"{note}. Fill out the details below."
         )
 
     with st.form("request_form", clear_on_submit=False):
@@ -1392,7 +1505,8 @@ def page_request() -> None:
                 st.success(
                     f"Thank you, {name.strip()}. Your request for "
                     f"{chosen.strftime('%A, %B %d, %Y')} ({slot_for(chosen)['label']}) has been received "
-                    "and is now marked **Pending** on the calendar below."
+                    "and is now marked **Pending** on the calendar below. "
+                    "A confirmation has been emailed to you."
                 )
                 st.balloons()
             else:
@@ -1554,7 +1668,7 @@ def page_admin() -> None:
         show = view[
             ["id", "event_date", "day_name", "slot_label", "name", "purpose",
              "num_people", "email", "phone", "comments", "status", "submitted_at",
-             "notify_status", "office_status", "decision_emails", "admin_note"]
+             "notify_status", "office_status", "decision_emails", "ack_status", "admin_note"]
         ].rename(
             columns={
                 "id": "ID", "event_date": "Date", "day_name": "Day", "slot_label": "Time",
@@ -1562,7 +1676,8 @@ def page_admin() -> None:
                 "email": "Email", "phone": "Phone", "comments": "Comments",
                 "status": "Status", "submitted_at": "Submitted",
                 "notify_status": "Emailed you", "office_status": "Emailed office",
-                "decision_emails": "Decision sent", "admin_note": "Note",
+                "decision_emails": "Decision sent", "ack_status": "Requester ack",
+                "admin_note": "Note",
             }
         )
         st.dataframe(show, hide_index=True, use_container_width=True)
