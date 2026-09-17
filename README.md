@@ -28,6 +28,9 @@ One event per date. Mon-Thu are shown as not bookable.
 
 ## Approve or decline from the email
 
+> **Currently in test mode.** `EMAIL_TO` in `app.py` is set to `muradpic12@gmail.com`, not the church office, so a live trial cannot reach anyone real. The Admin page shows a red banner while this is true. To go live, set `EMAIL_TO = REAL_OFFICE_EMAIL`.
+
+
 When a request is submitted the app sends three emails immediately:
 
 1. **To the requester**, confirming it arrived and stating clearly that it is a request, not a booking, and the date is not theirs until the office approves.

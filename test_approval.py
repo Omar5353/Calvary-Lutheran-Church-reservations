@@ -15,7 +15,6 @@ os.environ["SMTP_PORT"] = "8025"
 os.environ["SMTP_SSL"] = "0"
 os.environ["GMAIL_APP_PASSWORD"] = "not-used-by-the-catcher"
 os.environ["APP_BASE_URL"] = "http://localhost:8501"
-os.environ["OFFICE_EMAIL"] = "muradpic12@gmail.com"   # the trial inbox, not the real office
 os.environ["NOTIFY_EMAIL"] = "5353murad@gmail.com"
 os.environ["ADMIN_PASSWORD"] = "test-admin-password"
 MAIL = os.environ.get("MAILBOX", "/tmp/mail.json")
@@ -100,7 +99,7 @@ office = [m for m in box if app.office_email() in m["to"]]
 owner = [m for m in box if app.notify_email() in m["to"]]
 check("one addressed to the trial office inbox", len(office) == 1)
 check("nothing addressed to the real church office",
-      not any("office@calvarylincoln.org" in t for m in box for t in m["to"]))
+      not any(app.REAL_OFFICE_EMAIL in t for m in box for t in m["to"]))
 check("one addressed to the organiser", len(owner) == 1)
 
 o = office[0]

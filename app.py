@@ -51,8 +51,15 @@ ACTIVE_STATUSES = (STATUS_PENDING, STATUS_RESERVED)
 # Email notification. The admin view builds a pre-filled Gmail compose link
 # so a request can be forwarded to the church office in one click.
 EMAIL_FROM = "5353murad@gmail.com"     # the Gmail account the draft opens in
-EMAIL_TO = "office@calvarylincoln.org"  # default; override with the office_email secret
-                                        # or the OFFICE_EMAIL environment variable
+# The real church office. Do not delete this line; it is what the test banner
+# compares against, and what you restore EMAIL_TO to when testing is finished.
+REAL_OFFICE_EMAIL = "office@calvarylincoln.org"
+
+# ---------------------------------------------------------------- TEST MODE
+# Approve / Decline emails are going to a test inbox, NOT the church office.
+# To go live, set this back to REAL_OFFICE_EMAIL.
+EMAIL_TO = "muradpic12@gmail.com"
+# ---------------------------------------------------------------------------
 EMAIL_CC = ""                           # optional, comma separated
 EMAIL_GREETING_NAME = "Leanna"          # who the message is addressed to by name
 EMAIL_SIGNOFF = "Omar Murad"
@@ -783,7 +790,8 @@ def notify_email() -> str:
 
 
 def is_test_routing() -> bool:
-    return office_email() != EMAIL_TO or notify_email() != NOTIFY_EMAIL
+    """True whenever the office email is going anywhere but the real office."""
+    return office_email() != REAL_OFFICE_EMAIL
 
 
 def app_password() -> str | None:
@@ -1581,7 +1589,8 @@ def page_admin() -> None:
         st.error(
             f"**Test routing is active.** Approve / Decline emails are going to "
             f"**{office_email()}** and copies to **{notify_email()}**, not to the church "
-            f"office. Remove the office_email / notify_email override before real use."
+            f"office ({REAL_OFFICE_EMAIL}). Set EMAIL_TO back to REAL_OFFICE_EMAIL in "
+            f"app.py, or clear the office_email override, before real use."
         )
 
     if using_postgres():
