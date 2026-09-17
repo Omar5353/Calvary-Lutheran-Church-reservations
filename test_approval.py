@@ -15,6 +15,8 @@ os.environ["SMTP_PORT"] = "8025"
 os.environ["SMTP_SSL"] = "0"
 os.environ["GMAIL_APP_PASSWORD"] = "not-used-by-the-catcher"
 os.environ["APP_BASE_URL"] = "http://localhost:8501"
+os.environ["OFFICE_EMAIL"] = "muradpic12@gmail.com"   # the trial inbox, not the real office
+os.environ["NOTIFY_EMAIL"] = "5353murad@gmail.com"
 os.environ["ADMIN_PASSWORD"] = "test-admin-password"
 MAIL = os.environ.get("MAILBOX", "/tmp/mail.json")
 
@@ -66,9 +68,11 @@ check("request accepted", ok)
 
 box = mailbox(expect=2)
 check("two emails went out on submission", len(box) == 2)
-office = [m for m in box if app.EMAIL_TO in m["to"]]
-owner = [m for m in box if app.NOTIFY_EMAIL in m["to"]]
-check("one addressed to the church office", len(office) == 1)
+office = [m for m in box if app.office_email() in m["to"]]
+owner = [m for m in box if app.notify_email() in m["to"]]
+check("one addressed to the trial office inbox", len(office) == 1)
+check("nothing addressed to the real church office",
+      not any("office@calvarylincoln.org" in t for m in box for t in m["to"]))
 check("one addressed to the organiser", len(owner) == 1)
 
 o = office[0]
@@ -112,7 +116,7 @@ check("calendar shows it as reserved",
 box = mailbox(expect=2)
 check("two emails went out on approval", len(box) == 2)
 to_req = [m for m in box if REQUESTER in m["to"]][0]
-to_own = [m for m in box if app.NOTIFY_EMAIL in m["to"]][0]
+to_own = [m for m in box if app.notify_email() in m["to"]][0]
 print(f"     requester subject: {to_req['subject']}")
 print(f"     organiser subject: {to_own['subject']}")
 check("requester told it was approved", "approved" in to_req["subject"].lower())
@@ -145,7 +149,7 @@ check("date is free again", day2.isoformat() not in app.status_map(day2, day2))
 box = mailbox(expect=2)
 check("two emails went out on decline", len(box) == 2)
 dec_req = [m for m in box if "tom.becker" in m["to"][0]][0]
-dec_own = [m for m in box if app.NOTIFY_EMAIL in m["to"]][0]
+dec_own = [m for m in box if app.notify_email() in m["to"]][0]
 SENTENCE = "Book another day, or please reserve any other day or other weekend."
 check("requester gets the exact wording requested", SENTENCE in dec_req["text"])
 check("wording is in the HTML part too", SENTENCE in dec_req["html"])

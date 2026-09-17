@@ -42,6 +42,16 @@ On confirming:
 
 The Approve and Decline buttons on the Admin page do exactly the same thing through the same code path, so the two routes cannot drift apart.
 
+### Doing a live trial safely
+
+Point the emails at your own inbox for one run, without editing any file:
+
+```bash
+OFFICE_EMAIL=muradpic12@gmail.com streamlit run app.py
+```
+
+While an override is active the Admin page shows a red banner naming the addresses in use, so a redirected app cannot be mistaken for the real one. Stop the app and start it normally to go back to the church office. On Streamlit Cloud the same override is an `office_email` line in the Secrets panel; delete the line to revert.
+
 ### How the links are secured
 
 Each link carries an HMAC signature tied to both the reservation id and the action. An Approve link cannot be edited into a Decline link, neither works on a different booking, and a guessed or altered signature is refused. The signing key comes from the `decision_secret` secret, falling back to `admin_password` if that is not set. Changing either one invalidates links already in flight.

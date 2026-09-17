@@ -51,13 +51,14 @@ ACTIVE_STATUSES = (STATUS_PENDING, STATUS_RESERVED)
 # Email notification. The admin view builds a pre-filled Gmail compose link
 # so a request can be forwarded to the church office in one click.
 EMAIL_FROM = "5353murad@gmail.com"     # the Gmail account the draft opens in
-EMAIL_TO = "office@calvarylincoln.org"  # who the draft is addressed to
+EMAIL_TO = "office@calvarylincoln.org"  # default; override with the office_email secret
+                                        # or the OFFICE_EMAIL environment variable
 EMAIL_CC = ""                           # optional, comma separated
 EMAIL_GREETING_NAME = "Leanna"          # who the message is addressed to by name
 EMAIL_SIGNOFF = "Omar Murad"
 
 # Automatic notification sent the moment a request is submitted.
-NOTIFY_EMAIL = "5353murad@gmail.com"
+NOTIFY_EMAIL = "5353murad@gmail.com"    # default; override with notify_email / NOTIFY_EMAIL
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 SMTP_USER = "5353murad@gmail.com"
@@ -731,6 +732,27 @@ def _secret(name: str) -> str | None:
     return os.environ.get(name.upper())
 
 
+def office_email() -> str:
+    """
+    Where the Approve / Decline email goes.
+
+    Overridable so a live trial can be pointed at your own inbox for one run,
+    without editing code that might then get committed by accident:
+
+        OFFICE_EMAIL=you@example.com streamlit run app.py
+    """
+    return _secret("office_email") or EMAIL_TO
+
+
+def notify_email() -> str:
+    """Where the organiser's copies go."""
+    return _secret("notify_email") or NOTIFY_EMAIL
+
+
+def is_test_routing() -> bool:
+    return office_email() != EMAIL_TO or notify_email() != NOTIFY_EMAIL
+
+
 def app_password() -> str | None:
     """
     The Gmail app password, with every space removed.
@@ -793,7 +815,7 @@ def notify_new_request(res_id: int) -> tuple[bool, str]:
     ]
 
     subject = f"New request: {row['name']}, {d.strftime('%a %b %d, %Y')}, {row['slot_label']}"
-    ok, msg = send_email(NOTIFY_EMAIL, subject, "\n".join(lines), reply_to=row["email"] or None)
+    ok, msg = send_email(notify_email(), subject, "\n".join(lines), reply_to=row["email"] or None)
     state = f"sent {datetime.now().strftime('%Y-%m-%d %H:%M')}" if ok else f"failed: {msg[:60]}"
     with closing_note(res_id, "notify_status", state):
         pass
@@ -803,7 +825,7 @@ def notify_new_request(res_id: int) -> tuple[bool, str]:
 def send_test_email() -> tuple[bool, str]:
     """Prove the mail settings work without needing a real request."""
     return send_email(
-        NOTIFY_EMAIL,
+        notify_email(),
         "Test from the Calvary Lutheran Church scheduler",
         "This is a test message from the reservation scheduler.\n\n"
         "If you are reading it, automatic notifications are working. You will get "
@@ -815,7 +837,7 @@ def send_test_email() -> tuple[bool, str]:
 def gmail_compose_url(row) -> str:
     """A Gmail compose window, pre-filled and ready to review and send."""
     subject, body = _email_parts(row)
-    params = {"view": "cm", "fs": "1", "to": EMAIL_TO, "su": subject, "body": body}
+    params = {"view": "cm", "fs": "1", "to": office_email(), "su": subject, "body": body}
     if EMAIL_CC:
         params["cc"] = EMAIL_CC
     if EMAIL_FROM:
@@ -829,7 +851,7 @@ def mailto_url(row) -> str:
     params = {"subject": subject, "body": body}
     if EMAIL_CC:
         params["cc"] = EMAIL_CC
-    return f"mailto:{EMAIL_TO}?" + urlencode(params, quote_via=quote)
+    return f"mailto:{office_email()}?" + urlencode(params, quote_via=quote)
 
 
 def draft_email_controls(row, key: str) -> None:
@@ -839,7 +861,7 @@ def draft_email_controls(row, key: str) -> None:
     a.link_button("Draft email to the office", gmail_compose_url(row), type="secondary")
     b.link_button("Use my default mail app", mailto_url(row))
     with st.expander("Preview the email"):
-        st.caption(f"From {EMAIL_FROM} to {EMAIL_TO}")
+        st.caption(f"From {EMAIL_FROM} to {office_email()}")
         st.text_input("Subject", subject, disabled=True, key=f"subj_{key}")
         st.code(body, language=None)
 
@@ -1019,7 +1041,8 @@ def send_office_request_email(res_id: int) -> tuple[bool, str]:
         return False, "Reservation not found."
     subject, text, html = office_email_parts(row)
     ok, msg = send_email(
-        EMAIL_TO, subject, text, html=html, reply_to=row["email"] or None, cc=EMAIL_CC or None
+        office_email(), subject, text, html=html, reply_to=row["email"] or None,
+        cc=EMAIL_CC or None
     )
     with closing_note(res_id, "office_status", "sent" if ok else f"failed: {msg[:60]}"):
         pass
@@ -1134,7 +1157,7 @@ def decide(res_id: int, approved: bool, note: str = "", notify: bool = True) -> 
             ok_r, _ = send_email(row["email"], s, t, html=h)
             sent.append(f"requester {'ok' if ok_r else 'failed'}")
         s, t, h = decision_email_parts(row, approved, for_requester=False)
-        ok_o, _ = send_email(NOTIFY_EMAIL, s, t, html=h, reply_to=row["email"] or None)
+        ok_o, _ = send_email(notify_email(), s, t, html=h, reply_to=row["email"] or None)
         sent.append(f"owner {'ok' if ok_o else 'failed'}")
         with closing_note(res_id, "decision_emails", ", ".join(sent)):
             pass
@@ -1440,6 +1463,13 @@ def page_admin() -> None:
         st.session_state["admin_ok"] = False
         st.rerun()
 
+    if is_test_routing():
+        st.error(
+            f"**Test routing is active.** Approve / Decline emails are going to "
+            f"**{office_email()}** and copies to **{notify_email()}**, not to the church "
+            f"office. Remove the office_email / notify_email override before real use."
+        )
+
     if using_postgres():
         st.caption("Storage: Supabase Postgres. Reservations survive restarts and redeploys.")
     else:
@@ -1452,14 +1482,14 @@ def page_admin() -> None:
     if not app_password():
         st.warning(
             "Automatic email notifications are off. Add `gmail_app_password` to your secrets "
-            "to have new requests emailed to " + NOTIFY_EMAIL + " as they arrive."
+            "to have new requests emailed to " + notify_email() + " as they arrive."
         )
     else:
         c_test, c_msg = st.columns([1, 3])
         if c_test.button("Send a test email"):
             ok, msg = send_test_email()
             if ok:
-                c_msg.success(f"Test email sent to {NOTIFY_EMAIL}.")
+                c_msg.success(f"Test email sent to {notify_email()}.")
             else:
                 c_msg.error(f"Could not send: {msg}")
 
