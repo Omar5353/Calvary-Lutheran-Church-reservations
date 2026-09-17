@@ -56,6 +56,21 @@ OFFICE_EMAIL=muradpic12@gmail.com streamlit run app.py
 
 While an override is active the Admin page shows a red banner naming the addresses in use, so a redirected app cannot be mistaken for the real one. Stop the app and start it normally to go back to the church office. On Streamlit Cloud the same override is an `office_email` line in the Secrets panel; delete the line to revert.
 
+### When an email does not arrive
+
+Every send is reported honestly. If the requester or organiser cannot be emailed, the decision page and the Admin page both say so, quoting the actual error, and note that the status was still changed. Nothing is ever reported as sent when it was not.
+
+The Admin page, under *All reservations, Email delivery*, shows what happened to each message for a chosen booking:
+
+```
+- Acknowledgement to requester: sent
+- Request to the office:        sent
+- Copy to you:                  sent
+- Decision emails:              requester FAILED, organiser FAILED | ConnectionRefusedError ...
+```
+
+A **Resend the decision emails** button there sends them again once the problem is fixed. Pressing Approve or Decline a second time also resends, since a repeated click usually means the first email never arrived.
+
 ### How the links are secured
 
 Each link carries an HMAC signature tied to both the reservation id and the action. An Approve link cannot be edited into a Decline link, neither works on a different booking, and a guessed or altered signature is refused. The signing key comes from the `decision_secret` secret, falling back to `admin_password` if that is not set. Changing either one invalidates links already in flight.

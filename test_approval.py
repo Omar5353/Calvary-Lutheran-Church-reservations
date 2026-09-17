@@ -153,12 +153,15 @@ check("organiser told it was approved", to_own["subject"].startswith("Approved:"
 check("organiser mail names the requester", "Maria Lopez" in to_own["text"])
 check("both sends recorded", "requester ok" in app.get_reservation(rid)["decision_emails"])
 
-print("\n--- approving twice does nothing ---")
+print("\n--- approving twice resends rather than going quiet ---")
 clear_mail()
 ok, msg = app.decide(rid, True)
-check("second approval is a no-op", ok and msg == "already reserved")
-import time as _t; _t.sleep(1.5)
-check("no duplicate emails", len(mailbox()) == 0)
+check("second approval changes nothing but reports cleanly", ok)
+check("it says the request was already approved", "already reserved" in msg.lower())
+check("status unchanged", app.get_reservation(rid)["status"] == app.STATUS_RESERVED)
+box = mailbox(expect=2)
+check("the outcome emails are sent again, because a second click usually "
+      "means the first email never arrived", len(box) == 2)
 
 # ------------------------------------------------------------------- decline
 print("\n--- the office declines a different request ---")

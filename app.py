@@ -1244,39 +1244,96 @@ color:#111;line-height:1.55;max-width:600px">
     return subject, text, html
 
 
+def send_decision_emails(res_id: int, approved: bool) -> tuple[bool, str]:
+    """
+    Send the outcome emails for one decision and report honestly.
+
+    Returns (everything_sent, human readable detail). The detail is kept on
+    the row and shown in the app, because a silent mail failure is worse than
+    a loud one: the date changes either way and nobody finds out for days.
+    """
+    row = get_reservation(res_id)
+    if row is None:
+        return False, "That reservation no longer exists."
+
+    if not app_password():
+        detail = "no gmail_app_password configured, so nothing could be sent"
+        with closing_note(res_id, "decision_emails", detail):
+            pass
+        return False, detail
+
+    problems, notes = [], []
+
+    if row["email"]:
+        s_, t_, h_ = decision_email_parts(row, approved, for_requester=True)
+        ok_r, why_r = send_email(row["email"], s_, t_, html=h_)
+        notes.append(f"requester {'ok' if ok_r else 'FAILED'}")
+        if not ok_r:
+            problems.append(f"requester ({row['email']}): {why_r}")
+    else:
+        notes.append("requester skipped, no address given")
+        problems.append("the requester gave no email address")
+
+    s_, t_, h_ = decision_email_parts(row, approved, for_requester=False)
+    ok_o, why_o = send_email(notify_email(), s_, t_, html=h_, reply_to=row["email"] or None)
+    notes.append(f"organiser {'ok' if ok_o else 'FAILED'}")
+    if not ok_o:
+        problems.append(f"organiser ({notify_email()}): {why_o}")
+
+    stamp = datetime.now().strftime("%Y-%m-%d %H:%M")
+    detail = f"{stamp}: " + ", ".join(notes)
+    if problems:
+        detail += " | " + "; ".join(problems)
+    with closing_note(res_id, "decision_emails", detail[:400]):
+        pass
+
+    if problems:
+        return False, "; ".join(problems)
+    return True, "Requester and organiser have both been emailed."
+
+
 def decide(res_id: int, approved: bool, note: str = "", notify: bool = True) -> tuple[bool, str]:
     """
     Apply an approve or decline decision and tell everyone who needs to know.
 
     Used by both the buttons in the office email and the admin page, so the
     two routes can never drift apart.
+
+    The returned flag covers the WHOLE job, the status change and the emails.
+    An earlier version returned success as soon as the status changed and
+    threw the mail result away, so a failed send looked like a clean approval.
     """
     row = get_reservation(res_id)
     if row is None:
         return False, "That reservation no longer exists."
 
     target = STATUS_RESERVED if approved else STATUS_DECLINED
+
     if row["status"] == target:
+        # Already in the right state. Do not change anything, but the emails
+        # may well be why we are here, so offer to send them again.
+        if notify:
+            ok, detail = send_decision_emails(res_id, approved)
+            return ok, (
+                f"Already {target.lower()}. {detail}" if ok
+                else f"Already {target.lower()}, but the emails could not be sent: {detail}"
+            )
         return True, f"already {target.lower()}"
 
     ok, msg = set_status(res_id, target, note)
     if not ok:
         return False, msg
 
-    if notify:
-        row = get_reservation(res_id)
-        sent = []
-        if row["email"]:
-            s, t, h = decision_email_parts(row, approved, for_requester=True)
-            ok_r, _ = send_email(row["email"], s, t, html=h)
-            sent.append(f"requester {'ok' if ok_r else 'failed'}")
-        s, t, h = decision_email_parts(row, approved, for_requester=False)
-        ok_o, _ = send_email(notify_email(), s, t, html=h, reply_to=row["email"] or None)
-        sent.append(f"owner {'ok' if ok_o else 'failed'}")
-        with closing_note(res_id, "decision_emails", ", ".join(sent)):
-            pass
+    if not notify:
+        return True, f"{target.lower()}"
 
-    return True, f"{target.lower()}"
+    sent_ok, detail = send_decision_emails(res_id, approved)
+    if sent_ok:
+        return True, f"{target.capitalize()}. {detail}"
+    return False, (
+        f"The reservation was marked {target.lower()}, but the emails could not be "
+        f"sent: {detail}"
+    )
 
 
 def page_decision() -> bool:
@@ -1327,7 +1384,21 @@ def page_decision() -> bool:
 
     done_key = f"decided_{rid}_{action}"
     if st.session_state.get(done_key):
-        st.success(f"Done. This request is now **{row['status']}** and everyone has been emailed.")
+        outcome = st.session_state.get(done_key)
+        if outcome is True:
+            st.success(
+                f"Done. This request is now **{row['status']}**, and the requester and "
+                f"{EMAIL_SIGNOFF} have both been emailed."
+            )
+        else:
+            st.warning(
+                f"This request is now **{row['status']}**, but the notification emails "
+                f"could not be sent:\n\n{outcome}"
+            )
+            if st.button("Try sending the emails again"):
+                ok2, why2 = send_decision_emails(rid, approved)
+                st.session_state[done_key] = True if ok2 else why2
+                st.rerun()
         st.link_button("Open the scheduler", base_url())
         return True
 
@@ -1344,11 +1415,10 @@ def page_decision() -> bool:
     if c1.button(f"{verb} this request", type="primary"):
         with st.spinner("Saving and sending emails..."):
             ok, msg = decide(rid, approved, note=f"{verb}d from the office email")
-        if ok:
-            st.session_state[done_key] = True
-            st.rerun()
-        else:
-            st.error(msg)
+        # ok covers the emails as well as the status, so a mail failure is
+        # recorded rather than being shown as a clean success.
+        st.session_state[done_key] = True if ok else msg
+        st.rerun()
     c2.caption("Nothing has been changed yet. Nobody is emailed until you press the button.")
     return True
 
@@ -1622,6 +1692,16 @@ def page_admin() -> None:
         render_calendar(show_details=True, key="admin_month")
 
     with tab_review:
+        last = st.session_state.pop("last_decision", None)
+        if last:
+            ok, msg = last
+            (st.success if ok else st.error)(msg)
+            if not ok:
+                st.caption(
+                    "The status was still changed. Use Resend below once the mail "
+                    "problem is sorted, so the requester is not left guessing."
+                )
+
         pending = all_reservations((STATUS_PENDING,))
         if pending.empty:
             st.info("No pending requests right now.")
@@ -1644,12 +1724,12 @@ def page_admin() -> None:
                 if b1.button("Approve", key=f"ok_{r['id']}", type="primary"):
                     with st.spinner("Approving and sending emails..."):
                         ok, msg = decide(int(r["id"]), True, note)
-                    st.toast(f"Approved. {msg}" if ok else msg)
+                    st.session_state["last_decision"] = (ok, msg)
                     st.rerun()
                 if b2.button("Decline", key=f"no_{r['id']}"):
                     with st.spinner("Declining and sending emails..."):
                         ok, msg = decide(int(r["id"]), False, note)
-                    st.toast(f"Declined. {msg}" if ok else msg)
+                    st.session_state["last_decision"] = (ok, msg)
                     st.rerun()
 
     with tab_table:
@@ -1698,6 +1778,37 @@ def page_admin() -> None:
             file_name=f"calvary_reservations_{date.today().isoformat()}.csv",
             mime="text/csv",
         )
+
+        st.divider()
+        st.markdown("**Email delivery**")
+        st.caption(
+            "What happened to each message for a reservation. Anything reading FAILED "
+            "never reached its recipient."
+        )
+        ids_all = view["id"].tolist()
+        if ids_all:
+            def _lbl(i: int) -> str:
+                rr = view[view["id"] == i].iloc[0]
+                return f"#{i}, {rr['event_date']}, {rr['name']} ({rr['status']})"
+
+            pick_mail = st.selectbox("Reservation", ids_all, format_func=_lbl, key="mailstat")
+            rr = view[view["id"] == pick_mail].iloc[0]
+            st.write(
+                f"- Acknowledgement to requester: `{rr.get('ack_status') or 'not recorded'}`\n"
+                f"- Request to the office: `{rr.get('office_status') or 'not recorded'}`\n"
+                f"- Copy to you: `{rr.get('notify_status') or 'not recorded'}`\n"
+                f"- Decision emails: `{rr.get('decision_emails') or 'not sent yet'}`"
+            )
+            if rr["status"] in (STATUS_RESERVED, STATUS_DECLINED):
+                if st.button("Resend the decision emails", key=f"resend_{pick_mail}"):
+                    with st.spinner("Sending..."):
+                        ok_s, why_s = send_decision_emails(
+                            int(pick_mail), rr["status"] == STATUS_RESERVED
+                        )
+                    (st.success if ok_s else st.error)(why_s)
+                    st.rerun()
+            else:
+                st.caption("No decision has been made yet, so there is nothing to resend.")
 
         st.divider()
         st.markdown("**Email the office about one of these**")
