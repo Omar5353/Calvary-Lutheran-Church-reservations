@@ -27,25 +27,22 @@ def days_in(y, m):
     return [dt.date(y, m, d) for d in range(1, calendar.monthrange(y, m)[1] + 1)
             if dt.date(y, m, d).weekday() in app.SLOTS and dt.date(y, m, d) >= base]
 days = days_in(y, m)
-while len(days) < 7:
+while len(days) < 11:
     m = m % 12 + 1
     if m == 1: y += 1
     days = days_in(y, m)
 
-# Fill the month to one slot short of the cap. Only APPROVED bookings count
-# toward the limit, so the seeds have to be approved, not merely requested.
+# Fill the month to one place short of the limit. Pending requests hold a
+# place, so a plain request is enough to occupy one.
 for i in range(app.MAX_PER_MONTH - 1):
     ok, _ = app.create_request(days[i], f"Early {i}", "e@x.org", "", "P", 5, "")
     check(f"seed booking {i+1} accepted", ok)
-    rid = int(app.all_reservations()[app.all_reservations()["name"] == f"Early {i}"]["id"].iloc[0])
-    ok, _ = app.set_status(rid, app.STATUS_RESERVED)
-    check(f"seed booking {i+1} approved", ok)
 
 start = threading.Barrier(6)
 results, errors = [], []
 
 def racer(day, who):
-    """Submit a request. With the new rules these should all be accepted."""
+    """Six people submit at the same instant for the one remaining place."""
     try:
         start.wait()
         results.append(app.create_request(day, who, "r@x.org", "", "P", 5, "")[0])
@@ -59,52 +56,33 @@ for t in threads: t.join()
 
 print(f"     six simultaneous requests -> {sum(results)} accepted, {len(results)-sum(results)} refused")
 check("no exceptions leaked to the user", not errors)
-check("pending requests do not consume places, so all are accepted", sum(results) == 6)
-check("still only the seeded approvals count",
-      app.reserved_count_in_month(days[0]) == app.MAX_PER_MONTH - 1)
+check("exactly one request won the last place", sum(results) == 1)
+check("month sits exactly at the limit, never over",
+      app.active_count_in_month(days[0]) == app.MAX_PER_MONTH)
 check("no double booking on any date",
       len(app.all_reservations()) == len(set(app.all_reservations()["event_date"])))
 
-# ---- the real contention now: several people approving at the same instant
-print("\n--- six simultaneous APPROVALS for one remaining place ---")
-pending = app.all_reservations()
-pending = pending[pending["status"] == app.STATUS_PENDING]["id"].tolist()[:6]
-approved, approve_errors = [], []
-gate = threading.Barrier(len(pending))
-
-def approver(rid):
-    try:
-        gate.wait()
-        approved.append(app.set_status(int(rid), app.STATUS_RESERVED)[0])
-    except Exception as exc:
-        approve_errors.append(f"{rid}: {type(exc).__name__}: {exc}")
-
-ts = [threading.Thread(target=approver, args=(r,)) for r in pending]
-for t in ts: t.start()
-for t in ts: t.join()
-
-print(f"     {len(pending)} simultaneous approvals -> {sum(approved)} succeeded, "
-      f"{len(approved)-sum(approved)} refused")
-check("no exceptions during concurrent approvals", not approve_errors)
-check("exactly one approval won the last place", sum(approved) == 1)
-check("month sits exactly at the limit, never over",
+# ---- approving what is already pending must never push a month over
+print("\n--- approving the pending requests ---")
+for rid in app.all_reservations()["id"].tolist():
+    ok, msg = app.set_status(int(rid), app.STATUS_RESERVED)
+    check(f"approving #{rid} is allowed, it already held a place", ok)
+check("all approved, still exactly at the limit",
       app.reserved_count_in_month(days[0]) == app.MAX_PER_MONTH)
 
-# ---- declining an approval frees exactly one place
+# ---- declining frees exactly one place, and only one taker gets it
 print("\n--- declining frees one place ---")
-first_approved = app.all_reservations()
-first_approved = first_approved[first_approved["status"] == app.STATUS_RESERVED]["id"].iloc[0]
-app.set_status(int(first_approved), app.STATUS_DECLINED, "freeing a place")
-check("one place freed", app.reserved_count_in_month(days[0]) == app.MAX_PER_MONTH - 1)
+first_id = int(app.all_reservations()["id"].iloc[0])
+app.set_status(first_id, app.STATUS_DECLINED, "freeing a place")
+check("one place freed", app.active_count_in_month(days[0]) == app.MAX_PER_MONTH - 1)
 
-approved.clear()
-left = app.all_reservations()
-left = left[left["status"] == app.STATUS_PENDING]["id"].tolist()[:4]
-gate = threading.Barrier(len(left))
-ts = [threading.Thread(target=approver, args=(r,)) for r in left]
-for t in ts: t.start()
-for t in ts: t.join()
-check("exactly one took the freed place", sum(approved) == 1)
-check("back at the limit", app.reserved_count_in_month(days[0]) == app.MAX_PER_MONTH)
+results.clear()
+start = threading.Barrier(4)
+threads = [threading.Thread(target=racer, args=(days[app.MAX_PER_MONTH + 5 + i], f"Second{i}"))
+           for i in range(4)]
+for t in threads: t.start()
+for t in threads: t.join()
+check("exactly one took the freed place", sum(results) == 1)
+check("back at the limit", app.active_count_in_month(days[0]) == app.MAX_PER_MONTH)
 
 print(f"\nAll concurrency checks passed on {backend}.")

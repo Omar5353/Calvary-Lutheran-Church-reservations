@@ -42,7 +42,7 @@ Pressing either button opens a small page in the app showing the request, with o
 On confirming:
 
 - **Approve** marks the date Reserved on the calendar, emails the requester that they are confirmed, and emails you. Blocked if the month already holds the limit.
-- **Decline** frees the date for others, and emails the requester including the line *"Book another day, or please reserve any other day or other weekend."* plus a link back to the scheduler. You are emailed too.
+- **Decline** frees the date for others, and emails the requester including the line *"Please book another day."* plus a link back to the scheduler. You are emailed too.
 
 The Approve and Decline buttons on the Admin page do exactly the same thing through the same code path, so the two routes cannot drift apart.
 
@@ -90,17 +90,15 @@ DEFAULT_BASE_URL = "https://calvary-lutheran-church-reservations.streamlit.app"
 
 ## Monthly limit
 
-At most **2 approved reservations per calendar month**, set by `MAX_PER_MONTH` in `app.py`.
+At most **2 reservations per calendar month**, set by `MAX_PER_MONTH` in `app.py`.
 
-Only **approved** bookings count toward the limit. Pending requests appear on the calendar in amber and are visible to everyone, but they do not close the month, so several people can have requests in for the same month while the office works through them. A request nobody has reviewed yet can never lock everyone else out.
+A pending request **holds its place**. Two unreviewed requests therefore close the month to a third, who is told to pick another month. A place is taken the moment someone asks for it.
 
-The month fills when approvals reach the limit. At that point its remaining dates grey out as "Month full", drop off the date picker, and new requests are refused. Declining an approved booking reopens the month immediately; declining a pending one simply frees that date.
+Only a **decline** frees a place, whether the thing declined was pending or already approved. Approving a pending request changes nothing about the count, since that request was already holding its place, so an approval can never push a month over the limit.
 
-Once a month is full, any leftover pending requests for it cannot be approved. The office is told to decline one of the existing approvals first, rather than being allowed to go over quietly.
+When the limit is reached the month's remaining dates grey out as "Month full", drop off the date picker, and new requests are refused. The calendar caption spells out the position: *"2 of 2 places taken in September 2026 (0 approved, 2 awaiting a decision)"*.
 
-Both checks run inside a locked transaction, so simultaneous requests cannot skip the date check and simultaneous approvals cannot both take the last place.
-
-The calendar caption states the position plainly: *"1 of 2 approved in September 2026, 3 awaiting a decision"*.
+Both checks run inside a locked transaction, so six simultaneous requests for one remaining place produce exactly one winner.
 
 ## Automatic email notification
 

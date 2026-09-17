@@ -180,7 +180,7 @@ box = mailbox(expect=2)
 check("two emails went out on decline", len(box) == 2)
 dec_req = [m for m in box if "tom.becker" in m["to"][0]][0]
 dec_own = [m for m in box if app.notify_email() in m["to"]][0]
-SENTENCE = "Book another day, or please reserve any other day or other weekend."
+SENTENCE = "Please book another day."
 check("requester gets the exact wording requested", SENTENCE in dec_req["text"])
 check("wording is in the HTML part too", SENTENCE in dec_req["html"])
 check("requester mail says declined", "declined" in dec_req["subject"].lower())

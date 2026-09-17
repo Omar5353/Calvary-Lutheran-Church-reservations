@@ -406,8 +406,15 @@ def active_count_in_month(d: date, db: "Db | None" = None) -> int:
 
 
 def month_is_full(d: date) -> bool:
-    """A month is full only once the limit is reached by APPROVED bookings."""
-    return reserved_count_in_month(d) >= MAX_PER_MONTH
+    """
+    A month is full once the limit is reached by ACTIVE bookings, which means
+    pending as well as approved.
+
+    A request that is waiting on the office holds its place, so two unreviewed
+    requests close the month to a third. Declining one frees the place again
+    straight away.
+    """
+    return active_count_in_month(d) >= MAX_PER_MONTH
 
 
 INSERT_SQL = """
@@ -439,10 +446,11 @@ def create_request(
             # Lock first, then count, then insert, all in one transaction, so
             # two simultaneous submissions cannot both pass the monthly cap.
             db.lock_month(event_date)
-            if reserved_count_in_month(event_date, db) >= MAX_PER_MONTH:
+            if active_count_in_month(event_date, db) >= MAX_PER_MONTH:
                 return False, (
-                    f"{event_date.strftime('%B %Y')} already has {MAX_PER_MONTH} approved reservations, "
-                    "which is the limit for one month. Please choose a date in another month."
+                    f"{event_date.strftime('%B %Y')} already has {MAX_PER_MONTH} reservations "
+                    "requested or approved, which is the limit for one month. Please choose a "
+                    "date in another month."
                 )
             row_id = db.insert_returning_id(
                 INSERT_SQL,
@@ -524,17 +532,21 @@ def set_status(res_id: int, status: str, note: str = "") -> tuple[bool, str]:
         return False, "That reservation no longer exists."
 
     d = datetime.fromisoformat(row["event_date"]).date()
-    approving = status == STATUS_RESERVED and row["status"] != STATUS_RESERVED
+    # A pending request already occupies its place, so approving it never adds
+    # to the month's total. Only bringing a declined request back to life does.
+    approving = (
+        status == STATUS_RESERVED and row["status"] not in ACTIVE_STATUSES
+    )
 
     try:
         with Db() as db:
             if approving:
                 db.lock_month(d)
-                if reserved_count_in_month(d, db) >= MAX_PER_MONTH:
+                if active_count_in_month(d, db) >= MAX_PER_MONTH:
                     return False, (
-                        f"{d.strftime('%B %Y')} already has {MAX_PER_MONTH} approved "
-                        "reservations, which is the limit. Decline one of those before "
-                        "approving this."
+                        f"{d.strftime('%B %Y')} already has {MAX_PER_MONTH} reservations "
+                        "requested or approved, which is the limit. Decline one of those "
+                        "before approving this."
                     )
             db.execute(
                 "UPDATE reservations SET status = ?, admin_note = ? WHERE id = ?",
@@ -702,12 +714,16 @@ def render_calendar(show_details: bool, key: str) -> None:
         c = month_counts(first, last, db).get((year, month), {"reserved": 0, "pending": 0})
     used, waiting = c["reserved"], c["pending"]
 
-    label = f"{used} of {MAX_PER_MONTH} approved in {pycalendar.month_name[month]} {year}"
+    taken_places = used + waiting
+    label = (
+        f"{taken_places} of {MAX_PER_MONTH} places taken in "
+        f"{pycalendar.month_name[month]} {year}"
+    )
     if waiting:
-        label += f", {waiting} awaiting a decision"
+        label += f" ({used} approved, {waiting} awaiting a decision)"
     st.caption(label)
     st.markdown(
-        month_html(year, month, taken, show_details, month_full=used >= MAX_PER_MONTH),
+        month_html(year, month, taken, show_details, month_full=taken_places >= MAX_PER_MONTH),
         unsafe_allow_html=True,
     )
 
@@ -849,8 +865,8 @@ def notify_new_request(res_id: int) -> tuple[bool, str]:
     lines += [
         f"Submitted:         {str(row['submitted_at']).replace('T', ' ')}",
         "",
-        f"{d.strftime('%B %Y')}: {reserved_count_in_month(d)} of {MAX_PER_MONTH} approved, "
-        f"{pending_count_in_month(d)} awaiting a decision.",
+        f"{d.strftime('%B %Y')}: {active_count_in_month(d)} of {MAX_PER_MONTH} places taken "
+        f"({reserved_count_in_month(d)} approved, {pending_count_in_month(d)} awaiting a decision).",
         "",
         f"The office has been emailed with Approve and Decline buttons. You will get "
         f"another message once {EMAIL_GREETING_NAME or 'the office'} decides.",
@@ -1207,7 +1223,7 @@ Kind regards,
 Thank you for your interest in using {CHURCH_NAME}. Unfortunately your
 request for {when} could not be approved.
 
-Book another day, or please reserve any other day or other weekend.
+Please book another day.
 
 You can see what is still open and submit a new request here:
 {base_url()}
@@ -1449,7 +1465,10 @@ def page_request() -> None:
         taken = status_map(today, horizon, db)
         counts = month_counts(today.replace(day=1), horizon_end, db)
 
-    full_months = {ym for ym, c in counts.items() if c["reserved"] >= MAX_PER_MONTH}
+    full_months = {
+        ym for ym, c in counts.items()
+        if c["reserved"] + c["pending"] >= MAX_PER_MONTH
+    }
 
     open_dates = [
         d
@@ -1460,7 +1479,7 @@ def page_request() -> None:
     if not open_dates:
         st.warning(
             "There are no open dates in the next few months. Every month is either fully "
-            f"booked or already at the limit of {MAX_PER_MONTH} approved reservations. "
+            f"booked or already at the limit of {MAX_PER_MONTH} reservations. "
             "Please check back later."
         )
         availability_section()
@@ -1525,20 +1544,22 @@ def page_request() -> None:
         st.error(blocker)
     elif (chosen.year, chosen.month) in full_months:
         blocker = (
-            f"**{chosen.strftime('%B %Y')}** already has {MAX_PER_MONTH} approved reservations, which is "
-            "the limit for one month. Please pick a date in a different month."
+            f"**{chosen.strftime('%B %Y')}** already has {MAX_PER_MONTH} reservations requested "
+            "or approved, which is the limit for one month. Please pick a date in a "
+            "different month."
         )
         st.error(blocker)
     else:
         blocker = None
         c = counts.get((chosen.year, chosen.month), {"reserved": 0, "pending": 0})
-        left = MAX_PER_MONTH - c["reserved"]
-        note = (
-            f"{left} of {MAX_PER_MONTH} places left in {chosen.strftime('%B')}"
-            if not c["pending"]
-            else f"{left} of {MAX_PER_MONTH} places left in {chosen.strftime('%B')}, with "
-                 f"{c['pending']} other request{'s' if c['pending'] > 1 else ''} awaiting a decision"
-        )
+        left = MAX_PER_MONTH - (c["reserved"] + c["pending"])
+        note = f"{left} of {MAX_PER_MONTH} places left in {chosen.strftime('%B')}"
+        if c["pending"]:
+            note += (
+                f", since {c['pending']} other request"
+                f"{'s are' if c['pending'] > 1 else ' is'} already holding a place "
+                "while the office reviews"
+            )
         st.success(
             f"**{chosen.strftime('%A, %B %d, %Y')}**, {picked_slot['label']} is open. "
             f"{note}. Fill out the details below."

@@ -47,7 +47,7 @@ check("body has name", "Maria Lopez" in body)
 check("body has purpose", "Quinceanera reception" in body)
 check("body has headcount", "120" in body)
 check("body has comments", "Kitchen and A/V" in body)
-check("body shows month usage", "0 of 2 approved" in body and "1 awaiting" in body)
+check("body shows month usage", "1 of 2 places taken" in body and "1 awaiting a decision" in body)
 
 row = app.get_reservation(int(app.all_reservations()["id"].iloc[0]))
 check("db records the send", row["notify_status"].startswith("sent "))

@@ -36,14 +36,17 @@ ok1,_ = app.create_request(cands[0], "A", "a@x.org", "", "P1", 10, "")
 ok2,_ = app.create_request(cands[1], "B", "b@x.org", "", "P2", 10, "")
 check("first two accepted", ok1 and ok2)
 check("two pending in the month", app.pending_count_in_month(cands[0]) == 2)
-check("pending alone does NOT fill the month", not app.month_is_full(cands[0]))
+check("pending requests hold their places, so the month is full",
+      app.month_is_full(cands[0]))
+check("two places taken", app.active_count_in_month(cands[0]) == 2)
 
-# only approvals count toward the limit
+# approving a pending request does not change how many places are taken
 for nm in ("A", "B"):
     rid = int(app.all_reservations()[app.all_reservations()["name"] == nm]["id"].iloc[0])
-    app.set_status(rid, app.STATUS_RESERVED)
+    ok, _ = app.set_status(rid, app.STATUS_RESERVED)
+    check(f"approving {nm} is allowed, it already held a place", ok)
 check("two approved", app.reserved_count_in_month(cands[0]) == 2)
-check("month reports full once approved", app.month_is_full(cands[0]))
+check("still full", app.month_is_full(cands[0]))
 
 ok3, msg3 = app.create_request(cands[2], "C", "c@x.org", "", "P3", 10, "")
 check("third rejected", not ok3)
@@ -53,18 +56,16 @@ print("     msg:", msg3)
 # decline one -> a slot frees up
 rid = int(app.all_reservations()["id"].iloc[0])
 app.set_status(rid, app.STATUS_DECLINED, "conflict")
-check("count back to 1", app.reserved_count_in_month(cands[0]) == 1)
+check("count back to 1", app.active_count_in_month(cands[0]) == 1)
 check("month no longer full", not app.month_is_full(cands[0]))
 ok4,_ = app.create_request(cands[2], "C", "c@x.org", "", "P3", 10, "")
 check("third accepted after decline", ok4)
-rid_c = int(app.all_reservations()[app.all_reservations()["name"] == "C"]["id"].iloc[0])
-app.set_status(rid_c, app.STATUS_RESERVED)
-check("count is 2 again", app.reserved_count_in_month(cands[0]) == 2)
+check("count is 2 again", app.active_count_in_month(cands[0]) == 2)
 
 # re-approving the declined one must not exceed the cap
 ok5, msg5 = app.set_status(rid, app.STATUS_RESERVED)
 check("re-approve blocked at cap", not ok5)
-check("re-approve message explains", "already has 2 approved" in msg5)
+check("re-approve message explains", "requested or approved" in msg5)
 print("     msg:", msg5)
 
 # next month is unaffected
