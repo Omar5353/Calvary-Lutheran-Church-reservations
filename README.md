@@ -26,6 +26,39 @@ A small Streamlit app for taking event space requests and tracking them on a cal
 
 One event per date. Mon-Thu are shown as not bookable.
 
+## Approve or decline from the email
+
+When a request is submitted the app sends two emails immediately:
+
+1. **To you**, a heads-up with the details.
+2. **To the church office** (`EMAIL_TO`), the same details plus **Approve** and **Decline** buttons.
+
+Pressing either button opens a small page in the app showing the request, with one confirmation button. Nothing changes until that is pressed. This matters because mail scanners, link previewers and some corporate security products fetch every URL in an incoming message; if the link itself decided the outcome, a booking could be approved before anyone read it.
+
+On confirming:
+
+- **Approve** marks the date Reserved on the calendar, emails the requester that they are confirmed, and emails you.
+- **Decline** frees the date for others, and emails the requester including the line *"Book another day, or please reserve any other day or other weekend."* plus a link back to the scheduler. You are emailed too.
+
+The Approve and Decline buttons on the Admin page do exactly the same thing through the same code path, so the two routes cannot drift apart.
+
+### How the links are secured
+
+Each link carries an HMAC signature tied to both the reservation id and the action. An Approve link cannot be edited into a Decline link, neither works on a different booking, and a guessed or altered signature is refused. The signing key comes from the `decision_secret` secret, falling back to `admin_password` if that is not set. Changing either one invalidates links already in flight.
+
+Deciding twice is a no-op, so a forwarded email cannot double-send anything.
+
+### Settings
+
+```python
+EMAIL_TO = "office@calvarylincoln.org"   # who gets the Approve / Decline email
+NOTIFY_EMAIL = "5353murad@gmail.com"     # who gets the copies
+EMAIL_GREETING_NAME = "Leanna"           # how the office email opens
+DEFAULT_BASE_URL = "https://calvary-lutheran-church-reservations.streamlit.app"
+```
+
+`DEFAULT_BASE_URL` must match the real address of the deployed app, since the buttons point there. Override it without editing code by adding `app_base_url` to secrets. If it is wrong, the emails still send but the buttons lead nowhere.
+
 ## Monthly limit
 
 At most **2 active reservations per calendar month**, set by `MAX_PER_MONTH` in `app.py`. Pending counts toward the limit, the same as Reserved, so two unreviewed requests close the month until you act on one. Declining frees the slot immediately and the month reopens.
@@ -128,7 +161,15 @@ Postgres does not stop the app from hibernating after 12 hours of no traffic; it
 POSTGRES_URL="postgresql://..." ./run_tests.sh          # against Postgres
 ```
 
-Covers the booking rules, the monthly cap, email drafting and encoding, app password sanitising, and six simultaneous submissions racing for one remaining slot.
+Covers the booking rules, the monthly cap, email drafting and encoding, app password sanitising, six simultaneous submissions racing for one remaining slot, and the whole approve/decline flow end to end.
+
+Email tests deliver to `mailcatcher.py`, a local capture server the runner starts for you, so **the tests never send real email**. To inspect what was captured, run it yourself and read the JSON:
+
+```bash
+python3 mailcatcher.py 8025 /tmp/mail.json &
+python3 test_approval.py
+python3 -m json.tool /tmp/mail.json | less
+```
 
 ## Deploying so others can reach it
 

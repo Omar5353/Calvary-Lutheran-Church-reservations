@@ -17,9 +17,11 @@ from __future__ import annotations
 import calendar as pycalendar
 import io
 import os
+import hashlib
+import hmac
 import smtplib
 import sqlite3
-from contextlib import closing
+from contextlib import closing, contextmanager
 from email.message import EmailMessage
 from datetime import date, datetime, timedelta
 from urllib.parse import quote, urlencode
@@ -56,9 +58,15 @@ EMAIL_SIGNOFF = "Omar Murad"
 
 # Automatic notification sent the moment a request is submitted.
 NOTIFY_EMAIL = "5353murad@gmail.com"
-SMTP_HOST = "smtp.gmail.com"
-SMTP_PORT = 465
+SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
+SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
 SMTP_USER = "5353murad@gmail.com"
+# Tests point these at a local capture server; SMTP_SSL=0 uses plain SMTP.
+SMTP_SSL = os.environ.get("SMTP_SSL", "1") != "0"
+
+# Public URL of the deployed app, used to build the Approve and Decline links
+# that go in the office email. Override with the app_base_url secret.
+DEFAULT_BASE_URL = "https://calvary-lutheran-church-reservations.streamlit.app"
 # The app password comes from st.secrets["gmail_app_password"] or the
 # GMAIL_APP_PASSWORD environment variable. Without it, notifications are
 # skipped and reservations still work normally.
@@ -246,7 +254,9 @@ def init_db() -> None:
                     status        TEXT    NOT NULL DEFAULT 'Pending',
                     submitted_at  TEXT    NOT NULL,
                     admin_note    TEXT,
-                    notify_status TEXT
+                    notify_status TEXT,
+                    office_status TEXT,
+                    decision_emails TEXT
                 )
                 """
             )
@@ -271,8 +281,13 @@ def init_db() -> None:
                 """
             )
             cols = {r[1] for r in db.execute("PRAGMA table_info(reservations)").fetchall()}
-            if "notify_status" not in cols:
-                db.execute("ALTER TABLE reservations ADD COLUMN notify_status TEXT")
+            for col in ("notify_status", "office_status", "decision_emails"):
+                if col not in cols:
+                    db.execute(f"ALTER TABLE reservations ADD COLUMN {col} TEXT")
+
+        if db.pg:
+            for col in ("office_status", "decision_emails"):
+                db.execute(f"ALTER TABLE reservations ADD COLUMN IF NOT EXISTS {col} TEXT")
 
         # One active (pending or reserved) request per date. Declined rows are
         # ignored so a date frees up again if you turn a request down. Both
@@ -427,7 +442,8 @@ def create_request(
     # The reservation is safely stored. Notifying is best effort from here on,
     # so a mail problem can never cost someone their booking.
     if row_id is not None:
-        notify_new_request(row_id)
+        notify_new_request(row_id)       # heads-up to the organiser
+        send_office_request_email(row_id)  # the one with Approve / Decline buttons
     return True, "Request submitted."
 
 
@@ -454,7 +470,7 @@ def all_reservations(statuses: tuple[str, ...] | None = None) -> pd.DataFrame:
     cols = [
         "id", "event_date", "day_name", "slot_label", "name", "email", "phone",
         "purpose", "num_people", "comments", "status", "submitted_at",
-        "admin_note", "notify_status",
+        "admin_note", "notify_status", "office_status", "decision_emails",
     ]
     if not rows:
         return pd.DataFrame(columns=cols)
@@ -738,29 +754,20 @@ def app_password() -> str | None:
 
 def notify_new_request(res_id: int) -> tuple[bool, str]:
     """
-    Email the request details the moment it is submitted.
+    Email the organiser the moment a request is submitted.
 
     Never raises. If no app password is configured, or the mail server is
-    unreachable, the reservation still stands and the failure is recorded in
-    the session so the admin page can show it.
+    unreachable, the reservation still stands and the outcome is recorded on
+    the row so the admin page can show it.
     """
-    def record(state: str) -> None:
-        try:
-            with closing(get_conn()) as conn, conn:
-                conn.execute(
-                    "UPDATE reservations SET notify_status = ? WHERE id = ?", (state, res_id)
-                )
-        except Exception:
-            pass
-
-    password = app_password()
-    if not password:
-        record("not configured")
-        return False, "No app password configured, notification skipped."
-
     row = get_reservation(res_id)
     if row is None:
         return False, "Reservation not found."
+
+    if not app_password():
+        with closing_note(res_id, "notify_status", "not configured"):
+            pass
+        return False, "No app password configured, notification skipped."
 
     d = datetime.fromisoformat(row["event_date"]).date()
     lines = [
@@ -781,51 +788,28 @@ def notify_new_request(res_id: int) -> tuple[bool, str]:
         "",
         f"This month now holds {active_count_in_month(d)} of {MAX_PER_MONTH} allowed reservations.",
         "",
-        "Open the Admin page to approve or decline it.",
+        f"The office has been emailed with Approve and Decline buttons. You will get "
+        f"another message once {EMAIL_GREETING_NAME or 'the office'} decides.",
     ]
 
-    msg = EmailMessage()
-    msg["Subject"] = f"New request: {row['name']}, {d.strftime('%a %b %d, %Y')}, {row['slot_label']}"
-    msg["From"] = SMTP_USER
-    msg["To"] = NOTIFY_EMAIL
-    if row["email"]:
-        msg["Reply-To"] = row["email"]
-    msg.set_content("\n".join(lines))
-
-    try:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as s:
-            s.login(SMTP_USER, password)
-            s.send_message(msg)
-    except Exception as exc:  # noqa: BLE001 - never block a booking on mail
-        record(f"failed: {type(exc).__name__}")
-        return False, str(exc)
-
-    record(f"sent {datetime.now().strftime('%Y-%m-%d %H:%M')}")
-    return True, "Notification sent."
+    subject = f"New request: {row['name']}, {d.strftime('%a %b %d, %Y')}, {row['slot_label']}"
+    ok, msg = send_email(NOTIFY_EMAIL, subject, "\n".join(lines), reply_to=row["email"] or None)
+    state = f"sent {datetime.now().strftime('%Y-%m-%d %H:%M')}" if ok else f"failed: {msg[:60]}"
+    with closing_note(res_id, "notify_status", state):
+        pass
+    return ok, msg
 
 
 def send_test_email() -> tuple[bool, str]:
-    """Prove the SMTP settings work without needing a real request."""
-    password = app_password()
-    if not password:
-        return False, "No app password configured."
-
-    msg = EmailMessage()
-    msg["Subject"] = "Test from the Calvary Lutheran Church scheduler"
-    msg["From"] = SMTP_USER
-    msg["To"] = NOTIFY_EMAIL
-    msg.set_content(
+    """Prove the mail settings work without needing a real request."""
+    return send_email(
+        NOTIFY_EMAIL,
+        "Test from the Calvary Lutheran Church scheduler",
         "This is a test message from the reservation scheduler.\n\n"
-        "If you are reading it, automatic notifications are working and you will "
-        "get one of these each time somebody submits a request."
+        "If you are reading it, automatic notifications are working. You will get "
+        "one of these each time somebody submits a request, and the church office "
+        "will get one with Approve and Decline buttons.",
     )
-    try:
-        with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=15) as s:
-            s.login(SMTP_USER, password)
-            s.send_message(msg)
-    except Exception as exc:  # noqa: BLE001
-        return False, f"{type(exc).__name__}: {exc}"
-    return True, "Sent."
 
 
 def gmail_compose_url(row) -> str:
@@ -858,6 +842,378 @@ def draft_email_controls(row, key: str) -> None:
         st.caption(f"From {EMAIL_FROM} to {EMAIL_TO}")
         st.text_input("Subject", subject, disabled=True, key=f"subj_{key}")
         st.code(body, language=None)
+
+
+
+
+# --------------------------------------------------------------------------
+# Approve / decline by email
+# --------------------------------------------------------------------------
+
+
+def base_url() -> str:
+    return (_secret("app_base_url") or DEFAULT_BASE_URL).rstrip("/")
+
+
+def _signing_key() -> bytes:
+    """
+    Key for signing the Approve and Decline links.
+
+    Uses the decision_secret if set, otherwise falls back to the admin
+    password so the feature works without extra configuration. Either way the
+    key never appears in a link; only a signature derived from it does.
+    """
+    raw = _secret("decision_secret") or _secret("admin_password") or "calvary-fallback-key"
+    return hashlib.sha256(raw.encode("utf-8")).digest()
+
+
+def action_token(res_id: int, action: str) -> str:
+    """
+    Signature proving a link came from us.
+
+    Tied to the reservation id AND the action, so an Approve link cannot be
+    edited into a Decline link, and neither works for a different booking.
+    """
+    msg = f"{res_id}:{action}".encode("utf-8")
+    return hmac.new(_signing_key(), msg, hashlib.sha256).hexdigest()[:32]
+
+
+def verify_token(res_id: int, action: str, token: str) -> bool:
+    if not token:
+        return False
+    return hmac.compare_digest(action_token(res_id, action), token)
+
+
+def decision_url(res_id: int, action: str) -> str:
+    params = urlencode({"r": res_id, "a": action, "t": action_token(res_id, action)})
+    return f"{base_url()}/?{params}"
+
+
+def send_email(
+    to: str,
+    subject: str,
+    body: str,
+    html: str | None = None,
+    reply_to: str | None = None,
+    cc: str | None = None,
+) -> tuple[bool, str]:
+    """
+    Send one message. Never raises, so a mail problem cannot break a booking.
+    """
+    password = app_password()
+    if not password:
+        return False, "No app password configured."
+    if not to:
+        return False, "No recipient."
+
+    msg = EmailMessage()
+    msg["Subject"] = subject
+    msg["From"] = SMTP_USER
+    msg["To"] = to
+    if cc:
+        msg["Cc"] = cc
+    if reply_to:
+        msg["Reply-To"] = reply_to
+    msg.set_content(body)
+    if html:
+        msg.add_alternative(html, subtype="html")
+
+    try:
+        if SMTP_SSL:
+            with smtplib.SMTP_SSL(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+                s.login(SMTP_USER, password)
+                s.send_message(msg)
+        else:  # local capture server in tests
+            with smtplib.SMTP(SMTP_HOST, SMTP_PORT, timeout=20) as s:
+                s.send_message(msg)
+    except Exception as exc:  # noqa: BLE001
+        return False, f"{type(exc).__name__}: {exc}"
+    return True, "sent"
+
+
+def _button(url: str, label: str, colour: str) -> str:
+    return (
+        f'<a href="{url}" style="background:{colour};color:#ffffff;text-decoration:none;'
+        f'padding:13px 30px;border-radius:6px;font-weight:600;font-size:15px;'
+        f'display:inline-block;font-family:-apple-system,Segoe UI,Roboto,sans-serif">'
+        f"{label}</a>"
+    )
+
+
+def office_email_parts(row) -> tuple[str, str, str]:
+    """Subject, plain text and HTML for the message that goes to the office."""
+    d = datetime.fromisoformat(row["event_date"]).date()
+    pretty = d.strftime("%A, %B %d, %Y")
+    rid = int(row["id"])
+    approve, decline = decision_url(rid, "approve"), decision_url(rid, "decline")
+
+    subject = f"Building reservation request, {row['name']}, {pretty}"
+
+    rows = [
+        ("Date", pretty),
+        ("Time", row["slot_label"]),
+        ("Requested by", row["name"]),
+        ("Purpose", row["purpose"]),
+        ("Number attending", str(row["num_people"])),
+        ("Email", row["email"] or "not provided"),
+        ("Phone", row["phone"] or "not provided"),
+    ]
+    if row["comments"]:
+        rows.append(("Comments", row["comments"]))
+
+    greeting = f"Dear {EMAIL_GREETING_NAME}," if EMAIL_GREETING_NAME else "Good morning,"
+    widest = max(len(k) for k, _ in rows) + 2
+    detail_text = "\n".join(f"{k + ':':<{widest}}{v}" for k, v in rows)
+
+    text = f"""{greeting}
+
+A request to reserve the church building came in through the online reservation form.
+
+{detail_text}
+
+Please approve or decline using one of these links:
+
+  Approve:  {approve}
+
+  Decline:  {decline}
+
+Either link opens a short confirmation page, so an accidental click cannot
+book or cancel anything on its own. Once you confirm, {EMAIL_SIGNOFF} and the
+person who asked are both notified automatically.
+
+Thank you,
+{EMAIL_SIGNOFF}
+"""
+
+    detail_html = "".join(
+        f'<tr><td style="padding:5px 18px 5px 0;color:#666;white-space:nowrap;'
+        f'vertical-align:top">{k}</td>'
+        f'<td style="padding:5px 0;color:#111"><b>{v}</b></td></tr>'
+        for k, v in rows
+    )
+
+    html = f"""<html><body style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;
+color:#111;line-height:1.55;max-width:600px">
+  <p>{greeting}</p>
+  <p>A request to reserve the church building came in through the online reservation form.</p>
+  <table style="border-collapse:collapse;font-size:15px;margin:18px 0">{detail_html}</table>
+  <p style="margin:26px 0 10px 0"><b>Is the building available?</b></p>
+  <p>{_button(approve, "&#10003;&nbsp; Approve", "#2e7d32")}
+     &nbsp;&nbsp;&nbsp;
+     {_button(decline, "&#10007;&nbsp; Decline", "#c62828")}</p>
+  <p style="color:#666;font-size:13px;margin-top:22px">
+    Either button opens a short confirmation page, so an accidental click cannot book
+    or cancel anything on its own. Once you confirm, {EMAIL_SIGNOFF} and the person who
+    asked are both notified automatically.
+  </p>
+  <p style="color:#666;font-size:13px">If the buttons do not work, copy this link:<br>
+    <span style="word-break:break-all">{approve}</span></p>
+  <p>Thank you,<br>{EMAIL_SIGNOFF}</p>
+</body></html>"""
+    return subject, text, html
+
+
+def send_office_request_email(res_id: int) -> tuple[bool, str]:
+    row = get_reservation(res_id)
+    if row is None:
+        return False, "Reservation not found."
+    subject, text, html = office_email_parts(row)
+    ok, msg = send_email(
+        EMAIL_TO, subject, text, html=html, reply_to=row["email"] or None, cc=EMAIL_CC or None
+    )
+    with closing_note(res_id, "office_status", "sent" if ok else f"failed: {msg[:60]}"):
+        pass
+    return ok, msg
+
+
+@contextmanager
+def closing_note(res_id: int, column: str, value: str):
+    """Record a per-reservation status column without ever raising."""
+    try:
+        with Db() as db:
+            db.execute(f"UPDATE reservations SET {column} = ? WHERE id = ?", (value, res_id))
+    except Exception:
+        pass
+    yield
+
+
+def decision_email_parts(row, approved: bool, for_requester: bool) -> tuple[str, str, str]:
+    d = datetime.fromisoformat(row["event_date"]).date()
+    pretty = d.strftime("%A, %B %d, %Y")
+    when = f"{pretty}, {row['slot_label']}"
+    word = "approved" if approved else "declined"
+
+    if for_requester:
+        subject = f"Reservation {word}: {d.strftime('%b %d, %Y')}, {CHURCH_NAME}"
+        if approved:
+            text = f"""Dear {row['name']},
+
+Good news. Your request to use {CHURCH_NAME} has been approved.
+
+Date:     {pretty}
+Time:     {row['slot_label']}
+Purpose:  {row['purpose']}
+Expected: {row['num_people']} people
+
+The date is now reserved for you on the church calendar. If anything about
+your plans changes, please reply to this message so we can update it.
+
+We look forward to hosting you.
+
+Kind regards,
+{EMAIL_SIGNOFF}
+{CHURCH_NAME}
+"""
+        else:
+            text = f"""Dear {row['name']},
+
+Thank you for your interest in using {CHURCH_NAME}. Unfortunately your
+request for {when} could not be approved.
+
+Book another day, or please reserve any other day or other weekend.
+
+You can see what is still open and submit a new request here:
+{base_url()}
+
+We are sorry for the inconvenience and hope to host you another time.
+
+Kind regards,
+{EMAIL_SIGNOFF}
+{CHURCH_NAME}
+"""
+    else:
+        subject = f"{word.capitalize()}: {row['name']}, {pretty}"
+        text = f"""The office has {word} a reservation request.
+
+Date:         {pretty}
+Time:         {row['slot_label']}
+Requested by: {row['name']}
+Purpose:      {row['purpose']}
+Attending:    {row['num_people']}
+Email:        {row['email'] or 'not provided'}
+Phone:        {row['phone'] or 'not provided'}
+
+{"The date is now marked Reserved on the calendar." if approved
+ else "The date has been released and is open for other requests again."}
+{row['name']} has been emailed about this decision.
+"""
+
+    colour = "#2e7d32" if approved else "#c62828"
+    body_html = text.replace("\n\n", "</p><p>").replace("\n", "<br>")
+    html = f"""<html><body style="font-family:-apple-system,Segoe UI,Roboto,sans-serif;
+color:#111;line-height:1.55;max-width:600px">
+<p style="font-size:17px;font-weight:700;color:{colour}">Request {word}</p>
+<p>{body_html}</p></body></html>"""
+    return subject, text, html
+
+
+def decide(res_id: int, approved: bool, note: str = "", notify: bool = True) -> tuple[bool, str]:
+    """
+    Apply an approve or decline decision and tell everyone who needs to know.
+
+    Used by both the buttons in the office email and the admin page, so the
+    two routes can never drift apart.
+    """
+    row = get_reservation(res_id)
+    if row is None:
+        return False, "That reservation no longer exists."
+
+    target = STATUS_RESERVED if approved else STATUS_DECLINED
+    if row["status"] == target:
+        return True, f"already {target.lower()}"
+
+    ok, msg = set_status(res_id, target, note)
+    if not ok:
+        return False, msg
+
+    if notify:
+        row = get_reservation(res_id)
+        sent = []
+        if row["email"]:
+            s, t, h = decision_email_parts(row, approved, for_requester=True)
+            ok_r, _ = send_email(row["email"], s, t, html=h)
+            sent.append(f"requester {'ok' if ok_r else 'failed'}")
+        s, t, h = decision_email_parts(row, approved, for_requester=False)
+        ok_o, _ = send_email(NOTIFY_EMAIL, s, t, html=h, reply_to=row["email"] or None)
+        sent.append(f"owner {'ok' if ok_o else 'failed'}")
+        with closing_note(res_id, "decision_emails", ", ".join(sent)):
+            pass
+
+    return True, f"{target.lower()}"
+
+
+def page_decision() -> bool:
+    """
+    Landing page for the Approve and Decline links in the office email.
+
+    Returns True when it handled the request, so main() can skip the normal
+    pages. Nothing is changed until the confirmation button is pressed, which
+    keeps mail scanners and link previewers from deciding on their own.
+    """
+    qp = st.query_params
+    rid_raw, action, token = qp.get("r"), qp.get("a"), qp.get("t")
+    if not rid_raw or action not in ("approve", "decline"):
+        return False
+
+    st.subheader("Reservation decision")
+
+    try:
+        rid = int(rid_raw)
+    except (TypeError, ValueError):
+        st.error("That link is not valid.")
+        return True
+
+    if not verify_token(rid, action, token or ""):
+        st.error(
+            "That link is not valid or has expired. Please use the buttons in the most "
+            "recent email, or ask the office to resend it."
+        )
+        return True
+
+    row = get_reservation(rid)
+    if row is None:
+        st.error("That reservation no longer exists.")
+        return True
+
+    d = datetime.fromisoformat(row["event_date"]).date()
+    approved = action == "approve"
+    verb = "Approve" if approved else "Decline"
+
+    with st.container(border=True):
+        st.markdown(
+            f"**{d.strftime('%A, %B %d, %Y')}**, {row['slot_label']}  \n"
+            f"**{row['name']}**, {row['purpose']}, {row['num_people']} people  \n"
+            f"{row['email'] or 'no email'}  {('| ' + row['phone']) if row['phone'] else ''}"
+        )
+        if row["comments"]:
+            st.caption(f"Comments: {row['comments']}")
+
+    done_key = f"decided_{rid}_{action}"
+    if st.session_state.get(done_key):
+        st.success(f"Done. This request is now **{row['status']}** and everyone has been emailed.")
+        st.link_button("Open the scheduler", base_url())
+        return True
+
+    if row["status"] != STATUS_PENDING:
+        st.info(
+            f"This request is already marked **{row['status']}**, so there is nothing to do. "
+            "If that is wrong, sign in to the Admin page to change it."
+        )
+        st.link_button("Open the scheduler", base_url())
+        return True
+
+    st.write(f"Confirm that you want to **{verb.lower()}** this request.")
+    c1, c2 = st.columns([1, 3])
+    if c1.button(f"{verb} this request", type="primary"):
+        with st.spinner("Saving and sending emails..."):
+            ok, msg = decide(rid, approved, note=f"{verb}d from the office email")
+        if ok:
+            st.session_state[done_key] = True
+            st.rerun()
+        else:
+            st.error(msg)
+    c2.caption("Nothing has been changed yet. Nobody is emailed until you press the button.")
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -1133,12 +1489,14 @@ def page_admin() -> None:
                 note = st.text_input("Internal note (optional)", key=f"note_{r['id']}")
                 b1, b2, _ = st.columns([1, 1, 4])
                 if b1.button("Approve", key=f"ok_{r['id']}", type="primary"):
-                    ok, msg = set_status(int(r["id"]), STATUS_RESERVED, note)
-                    st.toast(msg)
+                    with st.spinner("Approving and sending emails..."):
+                        ok, msg = decide(int(r["id"]), True, note)
+                    st.toast(f"Approved. {msg}" if ok else msg)
                     st.rerun()
                 if b2.button("Decline", key=f"no_{r['id']}"):
-                    ok, msg = set_status(int(r["id"]), STATUS_DECLINED, note)
-                    st.toast(msg)
+                    with st.spinner("Declining and sending emails..."):
+                        ok, msg = decide(int(r["id"]), False, note)
+                    st.toast(f"Declined. {msg}" if ok else msg)
                     st.rerun()
 
     with tab_table:
@@ -1166,14 +1524,15 @@ def page_admin() -> None:
         show = view[
             ["id", "event_date", "day_name", "slot_label", "name", "purpose",
              "num_people", "email", "phone", "comments", "status", "submitted_at",
-             "notify_status", "admin_note"]
+             "notify_status", "office_status", "decision_emails", "admin_note"]
         ].rename(
             columns={
                 "id": "ID", "event_date": "Date", "day_name": "Day", "slot_label": "Time",
                 "name": "Name", "purpose": "Purpose", "num_people": "People",
                 "email": "Email", "phone": "Phone", "comments": "Comments",
                 "status": "Status", "submitted_at": "Submitted",
-                "notify_status": "Emailed", "admin_note": "Note",
+                "notify_status": "Emailed you", "office_status": "Emailed office",
+                "decision_emails": "Decision sent", "admin_note": "Note",
             }
         )
         st.dataframe(show, hide_index=True, use_container_width=True)
@@ -1225,6 +1584,10 @@ def main() -> None:
 
     st.title(f"{CHURCH_NAME}")
     st.caption("Event space reservation scheduler")
+
+    # Approve / Decline links from the office email land here.
+    if page_decision():
+        return
 
     page = st.sidebar.radio("Menu", ["Request a reservation", "Admin"])
     st.sidebar.divider()
