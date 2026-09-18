@@ -58,7 +58,7 @@ REAL_OFFICE_EMAIL = "office@calvarylincoln.org"
 # ---------------------------------------------------------------- TEST MODE
 # Approve / Decline emails are going to a test inbox, NOT the church office.
 # To go live, set this back to REAL_OFFICE_EMAIL.
-EMAIL_TO = "muradpic12@gmail.com"
+EMAIL_TO = "5353murad@gmail.com"     # TEST recipient (the office stand-in); set to REAL_OFFICE_EMAIL to go live
 # ---------------------------------------------------------------------------
 EMAIL_CC = ""                           # optional, comma separated
 EMAIL_GREETING_NAME = "Leanna"          # who the message is addressed to by name
