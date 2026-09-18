@@ -15,7 +15,11 @@ os.environ["SMTP_PORT"] = "8025"
 os.environ["SMTP_SSL"] = "0"
 os.environ["GMAIL_APP_PASSWORD"] = "not-used-by-the-catcher"
 os.environ["APP_BASE_URL"] = "http://localhost:8501"
-os.environ["NOTIFY_EMAIL"] = "5353murad@gmail.com"
+# Distinct addresses so the test can tell the office copy from the organiser
+# copy. In production both are muradpic12@gmail.com; that collision is fine
+# there but would make the two indistinguishable here.
+os.environ["OFFICE_EMAIL"] = "office-trial@example.org"
+os.environ["NOTIFY_EMAIL"] = "organiser@example.org"
 os.environ["ADMIN_PASSWORD"] = "test-admin-password"
 MAIL = os.environ.get("MAILBOX", "/tmp/mail.json")
 

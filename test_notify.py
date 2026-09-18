@@ -29,7 +29,7 @@ ok, _ = app.create_request(d, "Maria Lopez", "maria@example.org", "402-555-0101"
                            "Quinceanera reception", 120, "Kitchen and A/V needed")
 check("request accepted", ok)
 check("connected to gmail", ("connect", "smtp.gmail.com", 465) in sent)
-check("logged in as the right account", ("login", "5353murad@gmail.com", "fake-app-password") in sent)
+check("logged in as the right account", ("login", "muradpic12@gmail.com", "fake-app-password") in sent)
 
 msgs = [s[1] for s in sent if s[0] == "msg"]
 check("three emails leave on submission (requester, organiser, office)", len(msgs) == 3)
@@ -38,8 +38,8 @@ check("the requester is acknowledged",
 check("the office is asked to decide",
       any(m["To"] == app.office_email() for m in msgs))
 
-msg = [m for m in msgs if m["To"] == "5353murad@gmail.com"][0]   # the organiser copy
-check("to the notify address", msg["To"] == "5353murad@gmail.com")
+msg = [m for m in msgs if m["To"] == "muradpic12@gmail.com"][0]   # the organiser copy
+check("to the notify address", msg["To"] == "muradpic12@gmail.com")
 check("reply-to is the requester", msg["Reply-To"] == "maria@example.org")
 body = msg.get_content()
 print("\n--- SUBJECT:", msg["Subject"]); print(body)

@@ -50,7 +50,7 @@ ACTIVE_STATUSES = (STATUS_PENDING, STATUS_RESERVED)
 
 # Email notification. The admin view builds a pre-filled Gmail compose link
 # so a request can be forwarded to the church office in one click.
-EMAIL_FROM = "5353murad@gmail.com"     # the Gmail account the draft opens in
+EMAIL_FROM = "muradpic12@gmail.com"     # the Gmail account the draft opens in
 # The real church office. Do not delete this line; it is what the test banner
 # compares against, and what you restore EMAIL_TO to when testing is finished.
 REAL_OFFICE_EMAIL = "office@calvarylincoln.org"
@@ -65,10 +65,10 @@ EMAIL_GREETING_NAME = "Leanna"          # who the message is addressed to by nam
 EMAIL_SIGNOFF = "Omar Murad"
 
 # Automatic notification sent the moment a request is submitted.
-NOTIFY_EMAIL = "5353murad@gmail.com"    # default; override with notify_email / NOTIFY_EMAIL
+NOTIFY_EMAIL = "muradpic12@gmail.com"    # default; override with notify_email / NOTIFY_EMAIL
 SMTP_HOST = os.environ.get("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT = int(os.environ.get("SMTP_PORT", "465"))
-SMTP_USER = "5353murad@gmail.com"
+SMTP_USER = "muradpic12@gmail.com"
 # Tests point these at a local capture server; SMTP_SSL=0 uses plain SMTP.
 SMTP_SSL = os.environ.get("SMTP_SSL", "1") != "0"
 

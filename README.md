@@ -81,7 +81,7 @@ Deciding twice is a no-op, so a forwarded email cannot double-send anything.
 
 ```python
 EMAIL_TO = "office@calvarylincoln.org"   # who gets the Approve / Decline email
-NOTIFY_EMAIL = "5353murad@gmail.com"     # who gets the copies
+NOTIFY_EMAIL = "muradpic12@gmail.com"     # who gets the copies
 EMAIL_GREETING_NAME = "Leanna"           # how the office email opens
 DEFAULT_BASE_URL = "https://calvary-lutheran-church-reservations.streamlit.app"
 ```
@@ -225,7 +225,7 @@ Note on Streamlit Community Cloud: its disk is not permanent, so the database ca
 Near the top of `app.py`:
 
 ```python
-EMAIL_FROM = "5353murad@gmail.com"      # the Gmail account the draft opens in
+EMAIL_FROM = "muradpic12@gmail.com"      # the Gmail account the draft opens in
 EMAIL_TO = "office@calvarylincoln.org"  # who the draft is addressed to
 EMAIL_CC = ""                           # optional, comma separated
 EMAIL_SIGNOFF = "Omar"
